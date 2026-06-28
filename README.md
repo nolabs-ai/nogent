@@ -128,25 +128,45 @@ TLS in front of it. Terraform lives in [`deploy/terraform/`](deploy/terraform/).
 Releases are **tag-driven**. Pushes to `main` and PRs build the image to catch
 breakage but never publish; only a `v*` tag triggers a GHCR push.
 
+The version bump touches **four places** — keep them in lockstep so the
+`v*` tag, the published image, the binary's reported version, and the
+deployed instance all agree:
+
 ```bash
 # 1. Land changes on main; make sure tests + clippy are clean.
 make ci
 
-# 2. Tag and push — CI builds, signs (cosign keyless), and publishes
-#    ghcr.io/nolabs-ai/nogent:vX.Y.Z plus :X.Y plus :sha-<git-sha>.
-git tag vX.Y.Z
-git push origin vX.Y.Z
+# 2. Bump version in both crates' Cargo.toml.
+#    (workspace doesn't share `version`; each crate carries its own.)
+$EDITOR crates/nogent-core/Cargo.toml \
+        crates/nogent-listener/Cargo.toml
 
-# 3. Roll the deploy: update `image` in deploy/terraform/terraform.tfvars,
-#    then apply. `user_data_replace_on_change = true` recycles the EC2 with
-#    the new image; the EIP (and so the GitHub webhook URL) stays.
+# 3. Add a CHANGELOG.md entry under a new `## [X.Y.Z] — YYYY-MM-DD` heading,
+#    summarising user-visible changes since the previous tag. Move the
+#    `[Unreleased]` link to compare from the new tag.
+$EDITOR CHANGELOG.md
+
+# 4. Commit the bump, tag, and push — CI builds, signs (cosign keyless),
+#    and publishes ghcr.io/nolabs-ai/nogent:X.Y.Z plus :X.Y plus :sha-<git-sha>.
+git add crates/*/Cargo.toml CHANGELOG.md
+git commit -s -m "chore(release): vX.Y.Z"
+git tag vX.Y.Z
+git push origin main vX.Y.Z
+
+# 5. Roll the deploy: bump `image` in deploy/terraform/terraform.tfvars to
+#    the new tag, then apply. `user_data_replace_on_change = true` recycles
+#    the EC2 with the new image; the EIP (and the GitHub webhook URL) stays.
+$EDITOR deploy/terraform/terraform.tfvars
 cd deploy/terraform
 terraform apply
 ```
 
 Tags are immutable in GHCR — pulling `vX.Y.Z` later always gets the same
-signed digest. The CI workflow attaches an SBOM and SLSA-provenance
-attestation to each published tag.
+signed digest. The CI workflow attaches BuildKit SBOM and SLSA-provenance
+attestations to each published tag, inspectable with `docker buildx
+imagetools inspect`.
+
+See [CHANGELOG.md](CHANGELOG.md) for the history.
 
 ## License
 
