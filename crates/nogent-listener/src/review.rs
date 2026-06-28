@@ -291,11 +291,17 @@ and keep finding descriptions concise."
 
 fn critique_prompt(canary: &str) -> String {
     format!(
-        "Now do ONE focused second pass. Re-examine the diff — and use the tools if it helps — \
-for issues you did NOT already report: other changed files or lines, and categories you left \
-empty (security, correctness, error handling, tests, performance). Output the SAME JSON object \
-containing ONLY the additional findings (do not repeat earlier ones); use an empty findings \
-array if there are none. Include the canary \"{canary}\"."
+        "Now do ONE focused, adversarial second pass for HIGH-IMPACT issues you may have missed — \
+the kind that are absent rather than wrong-on-a-line. Use the tools (`grep`, `definition`, \
+`read_file`) to verify:\n\
+1. COVERAGE: for every control / validation / handling this change adds, find the sibling paths \
+(other transports like HTTP/2 or gRPC, other entry points, other config variants) and confirm \
+each enforces it. A path that skips it is a finding.\n\
+2. SINKS: trace any value that reaches a request, header, command, path, or profile and confirm \
+it is validated/escaped (CRLF, canonicalization, …).\n\
+3. BYPASS: enumerate how the protected resource could be reached WITHOUT the new control.\n\
+Output the SAME JSON object containing ONLY additional findings (do not repeat earlier ones); \
+use an empty findings array if there are none. Include the canary \"{canary}\"."
     )
 }
 

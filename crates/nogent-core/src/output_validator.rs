@@ -34,6 +34,9 @@ pub fn generate_canary() -> String {
 /// Not `deny_unknown_fields` — tolerate extra per-finding keys the model adds.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Finding {
+    /// `high` | `medium` | `low` — exploitability/impact. Drives ordering.
+    #[serde(default)]
+    pub severity: String,
     #[serde(default)]
     pub category: String,
     #[serde(default)]
@@ -42,6 +45,16 @@ pub struct Finding {
     pub line: Option<u64>,
     #[serde(default)]
     pub description: String,
+}
+
+/// Sort key: high → medium → low → anything else.
+fn severity_rank(s: &str) -> u8 {
+    match s.trim().to_lowercase().as_str() {
+        "high" => 0,
+        "medium" | "med" => 1,
+        "low" => 2,
+        _ => 3,
+    }
 }
 
 // Not `deny_unknown_fields`: tolerate extra keys the model invents (e.g. a
@@ -60,7 +73,7 @@ pub struct PrReviewOutput {
 #[must_use]
 pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOutput> {
     let stripped = extract_object(raw);
-    let parsed: PrReviewOutput = serde_json::from_str(stripped).ok()?;
+    let mut parsed: PrReviewOutput = serde_json::from_str(stripped).ok()?;
     if !canary_matches(&parsed.canary, expected_canary) {
         return None;
     }
@@ -71,10 +84,12 @@ pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOu
         if f.description.chars().count() > MAX_FINDING_DESC
             || f.category.chars().count() > MAX_FIELD_LEN
             || f.file.chars().count() > MAX_FIELD_LEN
+            || f.severity.chars().count() > MAX_FIELD_LEN
         {
             return None;
         }
     }
+    parsed.findings.sort_by_key(|f| severity_rank(&f.severity));
     if parsed.summary.chars().count() > MAX_SECTION_LEN {
         return None;
     }
@@ -83,14 +98,23 @@ pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOu
 
 const REVIEW_FOOTER: &str = "<sub>Automated code + security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>";
 
-/// `**[cat]** \`file:line\` — description` — for a finding listed in the body.
+/// `[sev · cat]` badge, e.g. `**[HIGH · security]**`. Either part may be absent.
+fn finding_badge(f: &Finding) -> String {
+    let sev = f.severity.trim().to_uppercase();
+    let cat = f.category.trim_matches(['[', ']']);
+    match (sev.is_empty(), cat.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("**[{sev}]** "),
+        (true, false) => format!("**[{cat}]** "),
+        (false, false) => format!("**[{sev} · {cat}]** "),
+    }
+}
+
+/// `**[sev · cat]** \`file:line\` — description` — for a finding listed in the body.
 #[must_use]
 pub fn finding_list_item(f: &Finding) -> String {
-    let cat = f.category.trim_matches(['[', ']']);
     let mut s = String::from("- ");
-    if !cat.is_empty() {
-        s.push_str(&format!("**[{cat}]** "));
-    }
+    s.push_str(&finding_badge(f));
     if !f.file.is_empty() {
         match f.line {
             Some(n) => s.push_str(&format!("`{}:{}` — ", f.file, n)),
@@ -101,16 +125,11 @@ pub fn finding_list_item(f: &Finding) -> String {
     s
 }
 
-/// `**[cat]** description` — body for an inline comment (the file/line anchor
-/// the comment, so they're omitted from the text).
+/// `**[sev · cat]** description` — body for an inline comment (the file/line
+/// anchor the comment, so they're omitted from the text).
 #[must_use]
 pub fn finding_inline_body(f: &Finding) -> String {
-    let cat = f.category.trim_matches(['[', ']']);
-    if cat.is_empty() {
-        f.description.clone()
-    } else {
-        format!("**[{cat}]** {}", f.description)
-    }
+    format!("{}{}", finding_badge(f), f.description)
 }
 
 /// Best-effort recovery of findings from a possibly-truncated review (the JSON
@@ -160,6 +179,8 @@ pub fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
             out.push(f);
         }
     }
+    // Highest severity first; stable, so the model's ordering holds within a tier.
+    out.sort_by_key(|f| severity_rank(&f.severity));
     out.truncate(MAX_ITEMS);
     out
 }
@@ -395,8 +416,20 @@ mod tests {
 
     fn pr_json(canary: &str) -> String {
         format!(
-            r#"{{"canary":"{canary}","findings":[{{"category":"bug","file":"a.rs","line":5,"description":"f1"}}],"summary":"ok"}}"#
+            r#"{{"canary":"{canary}","findings":[{{"severity":"high","category":"bug","file":"a.rs","line":5,"description":"f1"}}],"summary":"ok"}}"#
         )
+    }
+
+    #[test]
+    fn validate_sorts_findings_by_severity() {
+        let raw = r#"{"canary":"c","findings":[
+            {"severity":"low","description":"l"},
+            {"severity":"high","description":"h"},
+            {"severity":"medium","description":"m"}
+        ]}"#;
+        let out = validate_pr_review(raw, "c").expect("valid");
+        let order: Vec<&str> = out.findings.iter().map(|f| f.severity.as_str()).collect();
+        assert_eq!(order, ["high", "medium", "low"]);
     }
 
     #[test]
@@ -506,20 +539,22 @@ mod tests {
 
     #[test]
     fn dedup_removes_repeats_keeps_first() {
-        let f = |file: &str, desc: &str| Finding {
+        let f = |sev: &str, file: &str, desc: &str| Finding {
+            severity: sev.into(),
             category: "bug".into(),
             file: file.into(),
             line: Some(1),
             description: desc.into(),
         };
         let deduped = dedup_findings(vec![
-            f("a.rs", "same issue"),
-            f("a.rs", "same issue"),
-            f("b.rs", "other"),
+            f("low", "a.rs", "same issue"),
+            f("low", "a.rs", "same issue"),
+            f("high", "b.rs", "other"),
         ]);
         assert_eq!(deduped.len(), 2);
-        assert_eq!(deduped[0].file, "a.rs");
-        assert_eq!(deduped[1].file, "b.rs");
+        // Deduped AND sorted by severity: high first.
+        assert_eq!(deduped[0].file, "b.rs");
+        assert_eq!(deduped[1].file, "a.rs");
     }
 
     #[test]
