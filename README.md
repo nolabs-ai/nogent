@@ -6,17 +6,25 @@
 
 # nogent
 
-`nogent` is a GitHub App that runs AI-powered **PR code review** and using Google Gemini.
+`nogent` is a GitHub App that runs AI-powered **PR code review**.
 
 **Triggers.** A PR is reviewed once when it's **opened / reopened / marked
 ready** (not on every push — that would be noisy). To re-review the latest
 commit, comment **`/nogent review`** on the PR. Issues are triaged on
-open/edit/reopen. PRs authored by **bots** (`dependabot`, `renovate`,
-`github-actions[bot]`, …) are skipped by default so a routine bump doesn't burn
-a review — comment `/nogent review` to force one.
+open/edit/reopen.
+
+PRs authored by **bots** (`dependabot`, `renovate`, `github-actions[bot]`, …)
+are skipped by default so a routine bump doesn't burn a review — comment `/nogent review`
+to force one.
 
 
-# security model
+# Security model and hardening
+The nogent reviewer is **agentic** — it can read files, list directories, and
+call external tools (e.g., `grep`) to navigate the repo and understand the diff. This
+is powerful, but it also means that **prompt injection** is a real risk: a malicious
+PR could try to trick the model into revealing secrets or taking unsafe actions. 
+
+To mitigate this, nogent implements several layers of defense:
 
 - **HMAC verification** of every webhook against the raw body, constant-time.
 - **Canary-gated output** — the model must echo a per-run random canary inside a
@@ -29,10 +37,8 @@ a review — comment `/nogent review` to force one.
 - **Bot-PR skip** — automated PRs from dependabot/renovate/etc. are ignored by
   default; a human comment is required to opt them in.
 
-## Security & hardening
-
-In addition to the app-layer defenses above, the published image and the
-reference AWS deployment are hardened end-to-end:
+In addition to the app-layer defenses above, the published image is signed and verified,
+and the runtime is hardened:
 
 **Container image** (`ghcr.io/nolabs-ai/nogent:vX.Y.Z`):
 - Built from Chainguard's **distroless `glibc-dynamic`** — no shell, no package
@@ -42,26 +48,6 @@ reference AWS deployment are hardened end-to-end:
   (`webpki-roots`); no host CA trust, no OpenSSL in the runtime.
 - **Signed with cosign** (keyless, OIDC), with SBOM and SLSA-provenance
   attestations published alongside each tagged release.
-
-**Host & infrastructure** (`deploy/terraform/`):
-- Secrets stored in **AWS Secrets Manager** and fetched at boot; never baked
-  into the image, never committed to git. The IAM role attached to the host
-  scopes `secretsmanager:GetSecretValue` to **one secret ARN**.
-- **No SSH** by default — administer over **SSM Session Manager**.
-- **IMDSv2 required** on the EC2 (blocks SSRF-style metadata theft).
-- Security group: only **80/443 ingress** (for ACME + webhooks); egress
-  restricted to HTTPS, DNS, and NTP.
-- Listener binds **127.0.0.1** behind **Caddy**, which handles automatic
-  Let's Encrypt TLS and is the only public surface.
-- Bootstrap places the PEM at `0640` owned by uid `65532` (readable only by
-  the container user) and the env file at `0600` root-only (read by the docker
-  daemon, never by the container).
-
-**Build & release pipeline** (`.github/workflows/image.yml`):
-- Branches and PRs **build the image** as a sanity check but never push to GHCR.
-- **Only `v*` tags publish** — push to GHCR, sign with cosign, attach SBOM and
-  provenance. This makes `terraform apply` against a tag a fully attestable
-  deploy.
 
 ## Customizing the review
 
@@ -88,14 +74,6 @@ Two layers, for two audiences:
 | `nogent-core` | Shared, transport-light logic: webhook event types, repo config (fail-secure), prompts, canary output validator, diff bounding, HMAC verify. |
 | `nogent-listener` | The app (axum). HMAC verify, App JWT + installation-token mint/cache, and the in-process GitHub + Gemini clients + review/triage orchestration. |
 
-## Build & test
-
-```bash
-make build      # cargo build --release
-make test       # cargo test --workspace
-make ci         # clippy (strict) + fmt-check + tests
-```
-
 ## Evaluate the reviewer locally
 
 Run the full review (real Gemini, real agentic navigation) against a local
@@ -114,14 +92,6 @@ It indexes the repo at `--repo`, feeds the diff to the model, logs each tool cal
 `--diff -` reads the diff from stdin. `GEMINI_MODEL` (default
 `gemini-3.5-flash`) and `GEMINI_THINKING_LEVEL` (default `high`) override the
 model and reasoning effort.
-
-## Deploy
-
-Full setup — GitHub App, secrets, the container image, AWS (Terraform or
-manual), security-group ports, verification and operations — is in
-**[DEPLOY.md](DEPLOY.md)**. nogent ships as a container
-([`docker/`](docker/), published to GHCR by CI); a Caddy container terminates
-TLS in front of it. Terraform lives in [`deploy/terraform/`](deploy/terraform/).
 
 ## Release
 
@@ -165,8 +135,6 @@ Tags are immutable in GHCR — pulling `vX.Y.Z` later always gets the same
 signed digest. The CI workflow attaches BuildKit SBOM and SLSA-provenance
 attestations to each published tag, inspectable with `docker buildx
 imagetools inspect`.
-
-See [CHANGELOG.md](CHANGELOG.md) for the history.
 
 ## License
 
