@@ -11,6 +11,20 @@ const GITHUB_API: &str = "https://api.github.com";
 const ACCEPT: &str = "application/vnd.github+json";
 const API_VERSION: &str = "2022-11-28";
 
+/// Percent-encode a single path segment (RFC 3986 unreserved set passes through).
+fn urlencode_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 pub struct GithubClient {
     http: reqwest::Client,
     token: String,
@@ -58,6 +72,112 @@ impl GithubClient {
             tracing::warn!("PR has >=100 changed files; only the first page was fetched");
         }
         Ok(files)
+    }
+
+    /// Fetch a file's raw content at `git_ref`. Returns `None` when the file is
+    /// absent, too large, binary, or otherwise not retrievable — callers fall
+    /// back to the diff for that file rather than failing the whole review.
+    pub async fn get_file_raw(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<String>> {
+        let enc_path = path
+            .split('/')
+            .map(urlencode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{enc_path}?ref={git_ref}");
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("token {}", self.token))
+            // Raw media type returns the file body directly (not base64 JSON).
+            .header("Accept", "application/vnd.github.raw+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            tracing::debug!(
+                path,
+                status = resp.status().as_u16(),
+                "skipping file content"
+            );
+            return Ok(None);
+        }
+        let bytes = resp.bytes().await?;
+        // Skip binary content (NUL byte) — only text is useful to the model.
+        if bytes.contains(&0) {
+            return Ok(None);
+        }
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(s) => Ok(Some(s)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Read maintainer-authored review guidance from a TRUSTED ref (the base
+    /// branch / base SHA — never the PR head, which a fork can modify). Tries
+    /// `NOGENT.md` then `.github/nogent.md`. Bounded to `max_bytes`.
+    pub async fn get_repo_guidance(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        max_bytes: usize,
+    ) -> Result<Option<String>> {
+        for path in ["NOGENT.md", ".github/nogent.md"] {
+            if let Some(mut content) = self.get_file_raw(owner, repo, path, git_ref).await? {
+                if content.len() > max_bytes {
+                    let end = content
+                        .char_indices()
+                        .take_while(|(i, _)| *i <= max_bytes)
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    content.truncate(end);
+                    content.push_str("\n[guidance truncated]");
+                }
+                return Ok(Some(content));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Download the repo tarball (gzip) at `git_ref`. Returns `None` if it is
+    /// missing or exceeds `max_bytes` (caller falls back to diff-only review).
+    /// reqwest follows GitHub's redirect to codeload automatically.
+    pub async fn download_tarball(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/tarball/{git_ref}");
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("token {}", self.token))
+            .header("Accept", ACCEPT)
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            tracing::debug!(status = resp.status().as_u16(), "tarball fetch failed");
+            return Ok(None);
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() > max_bytes {
+            tracing::info!(
+                bytes = bytes.len(),
+                "repo tarball exceeds cap; diff-only review"
+            );
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
     }
 
     /// Post a review comment on a PR (event = COMMENT, non-blocking).

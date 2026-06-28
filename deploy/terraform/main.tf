@@ -164,9 +164,10 @@ resource "aws_instance" "nogent" {
     secret_arn          = aws_secretsmanager_secret.nogent.arn
     domain              = var.domain
     acme_email          = var.acme_email
-    github_app_id       = var.github_app_id
-    gemini_model        = var.gemini_model
-    image               = var.image
+    github_app_id         = var.github_app_id
+    gemini_model          = var.gemini_model
+    gemini_thinking_level = var.gemini_thinking_level
+    image                 = var.image
     image_registry_auth = var.image_registry_auth
   })
   # Re-provision when user-data changes.

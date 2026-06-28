@@ -14,9 +14,10 @@ use serde::Deserialize;
 pub const FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming security review for this change \
 (the model output failed canary/shape validation). A maintainer should review manually.";
 
-const MAX_ITEMS: usize = 20;
-const MAX_ITEM_LEN: usize = 500;
-const MAX_SECTION_LEN: usize = 2_000;
+const MAX_ITEMS: usize = 30;
+const MAX_FINDING_DESC: usize = 1_500;
+const MAX_FIELD_LEN: usize = 300;
+const MAX_SECTION_LEN: usize = 4_000;
 
 /// Generate a 16-byte random canary, hex-encoded (32 chars).
 #[must_use]
@@ -28,31 +29,53 @@ pub fn generate_canary() -> String {
 
 // ── PR review ─────────────────────────────────────────────────────────────
 
+/// A single review finding. The model returns structured findings (with file +
+/// line) rather than flat strings, so reviews can later become inline comments.
+/// Not `deny_unknown_fields` — tolerate extra per-finding keys the model adds.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub struct Finding {
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub description: String,
+}
+
+// Not `deny_unknown_fields`: tolerate extra keys the model invents (e.g. a
+// leftover `open_questions`) — the canary, not schema strictness, is the gate.
+#[derive(Debug, Clone, Deserialize)]
 pub struct PrReviewOutput {
     pub canary: String,
     #[serde(default)]
-    pub findings: Vec<String>,
+    pub findings: Vec<Finding>,
     #[serde(default)]
-    pub open_questions: Vec<String>,
-    #[serde(default)]
-    pub security_posture: String,
+    pub summary: String,
 }
 
 /// Validate a raw model string as a PR review. Returns `None` on any failure
 /// (caller emits `FALLBACK_MESSAGE`).
 #[must_use]
 pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOutput> {
-    let stripped = strip_code_fence(raw);
+    let stripped = extract_object(raw);
     let parsed: PrReviewOutput = serde_json::from_str(stripped).ok()?;
     if !canary_matches(&parsed.canary, expected_canary) {
         return None;
     }
-    if !bounded_items(&parsed.findings) || !bounded_items(&parsed.open_questions) {
+    if parsed.findings.len() > MAX_ITEMS {
         return None;
     }
-    if parsed.security_posture.chars().count() > MAX_SECTION_LEN {
+    for f in &parsed.findings {
+        if f.description.chars().count() > MAX_FINDING_DESC
+            || f.category.chars().count() > MAX_FIELD_LEN
+            || f.file.chars().count() > MAX_FIELD_LEN
+        {
+            return None;
+        }
+    }
+    if parsed.summary.chars().count() > MAX_SECTION_LEN {
         return None;
     }
     Some(parsed)
@@ -62,9 +85,9 @@ pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOu
 #[must_use]
 pub fn format_pr_review_markdown(out: &PrReviewOutput) -> String {
     let mut s = String::new();
-    s.push_str("## 🛡️ nogent security review\n\n");
-    if !out.security_posture.is_empty() {
-        s.push_str(&out.security_posture);
+    s.push_str("## 🤖 nogent code review\n\n");
+    if !out.summary.is_empty() {
+        s.push_str(&out.summary);
         s.push_str("\n\n");
     }
     if out.findings.is_empty() {
@@ -72,25 +95,30 @@ pub fn format_pr_review_markdown(out: &PrReviewOutput) -> String {
     } else {
         s.push_str("**Findings:**\n\n");
         for f in &out.findings {
-            s.push_str(&format!("- {f}\n"));
+            let cat = f.category.trim_matches(['[', ']']);
+            let mut line = String::from("- ");
+            if !cat.is_empty() {
+                line.push_str(&format!("**[{cat}]** "));
+            }
+            if !f.file.is_empty() {
+                match f.line {
+                    Some(n) => line.push_str(&format!("`{}:{}` — ", f.file, n)),
+                    None => line.push_str(&format!("`{}` — ", f.file)),
+                }
+            }
+            line.push_str(&f.description);
+            s.push_str(&line);
+            s.push('\n');
         }
         s.push('\n');
     }
-    if !out.open_questions.is_empty() {
-        s.push_str("**Open questions:**\n\n");
-        for q in &out.open_questions {
-            s.push_str(&format!("- {q}\n"));
-        }
-        s.push('\n');
-    }
-    s.push_str("<sub>Automated semantic security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>");
+    s.push_str("<sub>Automated code + security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>");
     s
 }
 
 // ── Issue triage ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IssueTriageOutput {
     pub canary: String,
     #[serde(default)]
@@ -103,7 +131,7 @@ pub struct IssueTriageOutput {
 
 #[must_use]
 pub fn validate_issue_triage(raw: &str, expected_canary: &str) -> Option<IssueTriageOutput> {
-    let stripped = strip_code_fence(raw);
+    let stripped = extract_object(raw);
     let parsed: IssueTriageOutput = serde_json::from_str(stripped).ok()?;
     if !canary_matches(&parsed.canary, expected_canary) {
         return None;
@@ -145,6 +173,20 @@ pub fn format_issue_triage_markdown(out: &IssueTriageOutput) -> String {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/// Best-effort isolation of the JSON object from a model response: strip a
+/// Markdown code fence, and if there's prose around it, slice from the first
+/// `{` to the last `}`. The canary check still gates correctness.
+fn extract_object(raw: &str) -> &str {
+    let t = strip_code_fence(raw);
+    if t.starts_with('{') {
+        return t;
+    }
+    match (t.find('{'), t.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &t[a..=b],
+        _ => t,
+    }
+}
+
 /// Strip a leading/trailing Markdown code fence the model may wrap JSON in.
 fn strip_code_fence(raw: &str) -> &str {
     let t = raw.trim();
@@ -161,17 +203,13 @@ fn canary_matches(got: &str, expected: &str) -> bool {
     !expected.is_empty() && got == expected
 }
 
-fn bounded_items(items: &[String]) -> bool {
-    items.len() <= MAX_ITEMS && items.iter().all(|i| i.chars().count() <= MAX_ITEM_LEN)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn pr_json(canary: &str) -> String {
         format!(
-            r#"{{"canary":"{canary}","findings":["f1"],"open_questions":[],"security_posture":"ok"}}"#
+            r#"{{"canary":"{canary}","findings":[{{"category":"bug","file":"a.rs","line":5,"description":"f1"}}],"summary":"ok"}}"#
         )
     }
 
@@ -186,7 +224,28 @@ mod tests {
     fn valid_pr_output_passes() {
         let c = "abc123";
         let out = validate_pr_review(&pr_json(c), c).expect("valid");
-        assert_eq!(out.findings, vec!["f1"]);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].description, "f1");
+        assert_eq!(out.findings[0].file, "a.rs");
+        assert_eq!(out.findings[0].line, Some(5));
+    }
+
+    #[test]
+    fn real_model_shape_with_prose_prefix_passes() {
+        // Mirrors gemini-2.5-pro: prose, then a fenced JSON object with
+        // structured findings. extract_object must isolate the JSON.
+        let c = "deadbeef";
+        let raw = format!(
+            "Here is my review.\n\n### Summary\nLooks good.\n\n```json\n{{\
+\"canary\":\"{c}\",\
+\"findings\":[{{\"category\":\"[nit]\",\"file\":\"src/x.rs\",\"line\":42,\"description\":\"populate trust_domain\"}}],\
+\"summary\":\"1 nit\"}}\n```"
+        );
+        let out = validate_pr_review(&raw, c).expect("should validate");
+        assert_eq!(out.findings[0].line, Some(42));
+        let md = format_pr_review_markdown(&out);
+        assert!(md.contains("**[nit]**"));
+        assert!(md.contains("`src/x.rs:42`"));
     }
 
     #[test]
@@ -200,9 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_rejected() {
-        let raw = r#"{"canary":"c","findings":[],"evil":"steal"}"#;
-        assert!(validate_pr_review(raw, "c").is_none());
+    fn unknown_key_tolerated() {
+        // Extra keys the model invents are ignored (canary is the real gate).
+        let raw = r#"{"canary":"c","findings":[],"open_questions":[],"extra":1}"#;
+        assert!(validate_pr_review(raw, "c").is_some());
     }
 
     #[test]
@@ -213,8 +273,8 @@ mod tests {
 
     #[test]
     fn too_many_findings_rejected() {
-        let items = (0..21)
-            .map(|i| format!("\"f{i}\""))
+        let items = (0..MAX_ITEMS + 1)
+            .map(|i| format!(r#"{{"description":"f{i}"}}"#))
             .collect::<Vec<_>>()
             .join(",");
         let raw = format!(r#"{{"canary":"c","findings":[{items}]}}"#);
@@ -223,8 +283,8 @@ mod tests {
 
     #[test]
     fn oversized_finding_rejected() {
-        let big = "x".repeat(501);
-        let raw = format!(r#"{{"canary":"c","findings":["{big}"]}}"#);
+        let big = "x".repeat(MAX_FINDING_DESC + 1);
+        let raw = format!(r#"{{"canary":"c","findings":[{{"description":"{big}"}}]}}"#);
         assert!(validate_pr_review(&raw, "c").is_none());
     }
 

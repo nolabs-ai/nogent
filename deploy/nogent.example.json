@@ -6,7 +6,8 @@
   "pullRequestSecurityReview": {
     "enabled": true,
     "maxFiles": 25,
-    "maxPatchBytes": 120000
+    "maxPatchBytes": 120000,
+    "maxContextBytes": 400000
   },
   "additionalPolicyPaths": [
     ".github/security-policies",

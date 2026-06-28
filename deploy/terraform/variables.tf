@@ -53,7 +53,13 @@ variable "github_app_id" {
 variable "gemini_model" {
   type        = string
   description = "Gemini model id."
-  default     = "gemini-2.5-pro"
+  default     = "gemini-3.5-flash"
+}
+
+variable "gemini_thinking_level" {
+  type        = string
+  description = "Reasoning effort for Gemini 3.x models: minimal|low|medium|high. Empty to omit (e.g. for 2.5 models)."
+  default     = "high"
 }
 
 variable "image" {

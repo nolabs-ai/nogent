@@ -14,6 +14,9 @@ pub struct ListenerConfig {
     pub webhook_secret: Zeroizing<String>,
     pub gemini_api_key: Zeroizing<String>,
     pub gemini_model: String,
+    /// Reasoning level for thinking-capable models (Gemini 3.x): minimal | low |
+    /// medium | high. Empty → omitted (use for 2.5 models).
+    pub gemini_thinking_level: Option<String>,
     pub bind_addr: String,
     /// Max webhook body size in bytes.
     pub max_body_bytes: usize,
@@ -63,7 +66,11 @@ impl ListenerConfig {
             private_key_pem,
             webhook_secret,
             gemini_api_key,
-            gemini_model: opt("GEMINI_MODEL", "gemini-2.5-pro"),
+            gemini_model: opt("GEMINI_MODEL", "gemini-3.5-flash"),
+            gemini_thinking_level: match opt("GEMINI_THINKING_LEVEL", "high").trim() {
+                "" => None,
+                level => Some(level.to_string()),
+            },
             bind_addr: opt("NOGENT_BIND_ADDR", "127.0.0.1:8080"),
             max_body_bytes,
         })

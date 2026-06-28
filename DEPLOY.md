@@ -116,7 +116,8 @@ The listener reads these (see [`.env.example`](.env.example)):
 | `GITHUB_APP_PRIVATE_KEY` *or* `GITHUB_APP_PRIVATE_KEY_FILE` | **yes** | inline PEM (`\n`-escaped) **or** path to a PEM file. Deploys use the file form. |
 | `GITHUB_WEBHOOK_SECRET` | **yes** | the `openssl rand` value |
 | `GEMINI_API_KEY` | **yes** | Gemini key |
-| `GEMINI_MODEL` | no | default `gemini-2.5-pro` |
+| `GEMINI_MODEL` | no | default `gemini-3.5-flash` |
+| `GEMINI_THINKING_LEVEL` | no | reasoning effort for Gemini 3.x: `minimal\|low\|medium\|high` (default `high`); empty to omit (2.5 models) |
 | `NOGENT_BIND_ADDR` | no | default `127.0.0.1:8080` |
 | `NOGENT_MAX_BODY_BYTES` | no | webhook body cap, default 2 MiB |
 | `NOGENT_PROMPTS_DIR` | no | dir of Markdown system prompts to use instead of the embedded ones (see `crates/nogent-core/prompts/`) |
@@ -258,12 +259,21 @@ tune limits or disable a workflow:
 {
   "enabled": true,
   "issueTriage": { "enabled": true },
-  "pullRequestSecurityReview": { "enabled": true, "maxFiles": 25, "maxPatchBytes": 120000 }
+  "pullRequestSecurityReview": { "enabled": true, "maxFiles": 25, "maxPatchBytes": 120000, "maxContextBytes": 400000 }
 }
 ```
 
+(`maxPatchBytes` bounds the diff; `maxContextBytes` bounds the full changed-file
+content sent alongside it.)
+
 A **malformed** config is fail-secure: nogent skips the event rather than
 falling back to "enabled".
+
+For freeform review guidance (conventions, focus areas, what to ignore), add a
+**`NOGENT.md`** at the repo root (or `.github/nogent.md`) — see
+[`deploy/NOGENT.example.md`](deploy/NOGENT.example.md). nogent reads it from the
+**base branch** (trusted; a fork PR can't change it) and folds it into the
+reviewer's instructions.
 
 ---
 

@@ -12,6 +12,9 @@ use crate::error::{NogentError, Result};
 
 pub const DEFAULT_MAX_FILES: usize = 25;
 pub const DEFAULT_MAX_PATCH_BYTES: usize = 120_000;
+/// Byte budget for the full post-change content of changed files sent alongside
+/// the diff (so the model reviews each change inside its whole file).
+pub const DEFAULT_MAX_CONTEXT_BYTES: usize = 400_000;
 
 /// Raw on-disk shape. All fields optional so an author can set just one.
 /// Keys are camelCase to match the documented `.github/nogent.json` surface.
@@ -44,6 +47,8 @@ struct RawPrReview {
     max_files: Option<usize>,
     #[serde(default)]
     max_patch_bytes: Option<usize>,
+    #[serde(default)]
+    max_context_bytes: Option<usize>,
 }
 
 /// Fully resolved config with defaults applied. Carried in `EventJob`.
@@ -54,6 +59,7 @@ pub struct ResolvedConfig {
     pub pr_review_enabled: bool,
     pub max_files: usize,
     pub max_patch_bytes: usize,
+    pub max_context_bytes: usize,
     pub additional_policy_paths: Vec<String>,
 }
 
@@ -67,6 +73,7 @@ impl Default for ResolvedConfig {
             pr_review_enabled: true,
             max_files: DEFAULT_MAX_FILES,
             max_patch_bytes: DEFAULT_MAX_PATCH_BYTES,
+            max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
             additional_policy_paths: Vec::new(),
         }
     }
@@ -99,6 +106,10 @@ impl ResolvedConfig {
                 .max_patch_bytes
                 .unwrap_or(d.max_patch_bytes)
                 .clamp(1_000, 2_000_000),
+            max_context_bytes: pr
+                .max_context_bytes
+                .unwrap_or(d.max_context_bytes)
+                .clamp(10_000, 4_000_000),
             additional_policy_paths: parsed
                 .additional_policy_paths
                 .unwrap_or(d.additional_policy_paths),

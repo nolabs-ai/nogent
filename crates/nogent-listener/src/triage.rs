@@ -12,11 +12,25 @@ use crate::gemini_client::GeminiClient;
 use crate::github_client::GithubClient;
 
 pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()> {
+    let gh = GithubClient::new(token)?;
+
+    // Maintainer guidance from NOGENT.md on the default branch (trusted).
+    let guidance = if job.default_branch.is_empty() {
+        None
+    } else {
+        gh.get_repo_guidance(&job.owner, &job.repo, &job.default_branch, 16_384)
+            .await?
+    };
+
     let canary = generate_canary();
-    let system = issue_triage::system_instruction(&canary);
+    let system = issue_triage::system_instruction(&canary, guidance.as_deref());
     let user = issue_triage::user_prompt(job);
 
-    let gemini = GeminiClient::new(&cfg.gemini_api_key, &job.model)?;
+    let gemini = GeminiClient::new(
+        &cfg.gemini_api_key,
+        &job.model,
+        cfg.gemini_thinking_level.as_deref(),
+    )?;
     let raw = gemini.generate(&system, &user).await?;
 
     let body = match validate_issue_triage(&raw, &canary) {
@@ -24,13 +38,13 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         None => {
             tracing::warn!(
                 issue = job.number,
+                raw = %raw.chars().take(6000).collect::<String>(),
                 "model output failed validation; posting fallback"
             );
             FALLBACK_MESSAGE.to_string()
         }
     };
 
-    let gh = GithubClient::new(token)?;
     gh.post_issue_comment(&job.owner, &job.repo, job.number, &body)
         .await?;
     tracing::info!(issue = job.number, "posted issue triage");

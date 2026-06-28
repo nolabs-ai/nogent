@@ -38,6 +38,10 @@ globset = "0.4"
 # Canary generation.
 rand = "0.8"
 hex = "0.4"
+# Repo snapshot (tarball at the PR head) + code navigation for agentic review.
+flate2 = "1"
+tar = "0.4"
+regex = "1"
 # Load config from .env in dev.
 dotenvy = "0.15"
 

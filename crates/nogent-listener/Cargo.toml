@@ -22,3 +22,6 @@ zeroize = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+regex = { workspace = true }

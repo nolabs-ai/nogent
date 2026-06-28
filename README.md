@@ -34,22 +34,51 @@ titles, issue bodies, and the model's own response):
 - **Bounded diffs** (`maxFiles`/`maxPatchBytes`) and **fail-secure config**.
 
 > **Planned hardening:** running the per-event work inside a
-> [nono](https://github.com/always-further/nono) sandbox so the process handling
+> [nono](https://github.com/nolabs-ai/nono) sandbox so the process handling
 > untrusted content holds only phantom credentials and can reach only
 > allowlisted hosts. Removed for now to keep the deploy simple; the design slots
 > back in as a per-event worker.
 
 ## What the reviewer checks
 
-The scan's guidelines live in **out-of-tree Markdown** at
+The scan does **general code review and security review**. Its guidelines live
+in **out-of-tree Markdown** at
 [`crates/nogent-core/prompts/`](crates/nogent-core/prompts/) (editable without a
 rebuild; override with `NOGENT_PROMPTS_DIR`, reuse across projects). They tell
 the model **not** to duplicate what CI already runs (clippy with
 `-D clippy::unwrap_used`, rustfmt, tests, `cargo audit`, commit-lint) and to
-focus on semantic, sandbox-specific concerns: path footguns (`String` vs
+cover correctness/bugs, design fit, error handling, readability, test coverage
+and perf — plus sandbox-specific security: path footguns (`String` vs
 `Path::starts_with`, missing canonicalization, TOCTOU), overly-broad
 capabilities, silent security fallbacks, FFI/ABI breaks, Landlock-vs-Seatbelt
 divergence, missing `EnvVarGuard` in tests, missing `// SAFETY:`, and DCO.
+
+For each changed file the model receives the diff **and** the full post-change
+file content (bounded by `maxContextBytes`). Beyond that, it can **navigate the
+rest of the repo at the PR head** via tools — `grep`, `read_file`, `list_files`
+— in a bounded agentic loop (Gemini function-calling), so when the diff calls a
+function defined elsewhere it can look up that definition before judging the
+change. The repo is fetched once as a tarball into a bounded in-memory index
+(skips binaries/large files; over the cap it falls back to diff-only). Tool
+results are treated as untrusted content under the same injection rules.
+
+## Customizing the review
+
+Two layers, for two audiences:
+
+- **Per-repo guidance — `NOGENT.md`** (or `.github/nogent.md`) at the root of the
+  reviewed repo. Freeform Markdown where *maintainers* state their conventions
+  ("errors use `MyError`", "focus on `crypto/`", "ignore formatting"). nogent
+  appends it to the reviewer's instructions. It's read from the **base branch**
+  (never the PR head), so a fork PR can't change how it's reviewed; it can't
+  override the output contract or injection rules. Capped at ~16 KB. See
+  [`deploy/NOGENT.example.md`](deploy/NOGENT.example.md).
+- **Per-repo knobs — `.github/nogent.json`** (structured): enable/disable each
+  workflow and tune `maxFiles` / `maxPatchBytes` / `maxContextBytes`. See
+  [`deploy/nogent.example.json`](deploy/nogent.example.json).
+- **Operator-level base prompt — `NOGENT_PROMPTS_DIR`**: whoever *runs* nogent
+  can replace the whole system prompt (the Markdown in
+  [`crates/nogent-core/prompts/`](crates/nogent-core/prompts/)) without a rebuild.
 
 ## Crates
 
@@ -65,6 +94,24 @@ make build      # cargo build --release
 make test       # cargo test --workspace
 make ci         # clippy (strict) + fmt-check + tests
 ```
+
+## Evaluate the reviewer locally
+
+Run the full review (real Gemini, real agentic navigation) against a local
+checkout — no GitHub App, webhook, or posting:
+
+```bash
+make build
+git diff origin/main... > /tmp/pr.diff      # any unified diff
+GEMINI_API_KEY=<key> RUST_LOG=info \
+  ./target/release/nogent-listener --review-local --repo . --diff /tmp/pr.diff
+```
+
+It indexes the repo at `--repo`, feeds the diff to the model, logs each tool call
+(`grep`/`read_file`/`list_files`) as it navigates, and prints the Markdown
+review. `--diff -` reads the diff from stdin. `GEMINI_MODEL` (default
+`gemini-3.5-flash`) and `GEMINI_THINKING_LEVEL` (default `high`) override the
+model and reasoning effort.
 
 ## Deploy
 

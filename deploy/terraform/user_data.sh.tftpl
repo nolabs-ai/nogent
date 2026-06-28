@@ -33,6 +33,7 @@ GITHUB_APP_PRIVATE_KEY_FILE=/etc/nogent/app-private-key.pem
 GITHUB_WEBHOOK_SECRET=$${GH_WEBHOOK_SECRET}
 GEMINI_API_KEY=$${GEMINI_API_KEY}
 GEMINI_MODEL=${gemini_model}
+GEMINI_THINKING_LEVEL=${gemini_thinking_level}
 RUST_LOG=info
 EOF
 chmod 0600 /etc/nogent/app-private-key.pem /etc/nogent/nogent.env

@@ -20,7 +20,7 @@ pub struct Actor {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Repository {
-    /// e.g. "always-further/nono"
+    /// e.g. "nolabs-ai/nono"
     pub full_name: String,
     #[serde(default)]
     pub default_branch: String,
@@ -128,6 +128,9 @@ pub struct EventJob {
     pub body: String,
     pub author: String,
     pub html_url: String,
+    /// Repo default branch — used to read maintainer-authored guidance
+    /// (`NOGENT.md`) from a trusted ref for issue triage.
+    pub default_branch: String,
     /// PR-only fields (None for issue triage).
     pub base_ref: Option<String>,
     pub base_sha: Option<String>,
@@ -144,10 +147,10 @@ mod tests {
     #[test]
     fn owner_repo_splits() {
         let r = Repository {
-            full_name: "always-further/nono".to_string(),
+            full_name: "nolabs-ai/nono".to_string(),
             default_branch: "main".to_string(),
         };
-        assert_eq!(r.owner_repo(), Some(("always-further", "nono")));
+        assert_eq!(r.owner_repo(), Some(("nolabs-ai", "nono")));
     }
 
     #[test]

@@ -83,6 +83,40 @@ pub struct DiffDigest {
     pub total_files: usize,
 }
 
+/// Full post-change content of a changed file, for review context.
+#[derive(Debug, Clone)]
+pub struct FileContent {
+    pub filename: String,
+    pub content: String,
+}
+
+/// Build a bounded "current file contents" section so the model can review each
+/// change inside its whole file. Files are included in order until the shared
+/// byte budget is exhausted; the file that crosses the budget is truncated and
+/// any remaining files are noted as omitted.
+#[must_use]
+pub fn build_file_context(files: &[FileContent], max_context_bytes: usize) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut omitted = 0usize;
+    for f in files {
+        if used >= max_context_bytes {
+            omitted += 1;
+            continue;
+        }
+        let remaining = max_context_bytes.saturating_sub(used);
+        let body = truncate_on_char_boundary(&f.content, remaining);
+        used = used.saturating_add(body.len());
+        sections.push(format!("===== {} =====\n{}", f.filename, body));
+    }
+    if omitted > 0 {
+        sections.push(format!(
+            "[{omitted} more changed file(s) omitted to fit the context budget]"
+        ));
+    }
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +171,41 @@ mod tests {
         let files = vec![file("logo.png", None)];
         let d = build_digest(&files, 25, 120_000);
         assert!(d.text.contains("[no text patch available]"));
+    }
+
+    #[test]
+    fn file_context_respects_budget_and_notes_omissions() {
+        let files = vec![
+            FileContent {
+                filename: "a.rs".into(),
+                content: "x".repeat(5_000),
+            },
+            FileContent {
+                filename: "b.rs".into(),
+                content: "y".repeat(5_000),
+            },
+        ];
+        let ctx = build_file_context(&files, 3_000);
+        assert!(ctx.contains("===== a.rs ====="));
+        // Second file doesn't fit → noted as omitted.
+        assert!(ctx.contains("omitted to fit the context budget"));
+    }
+
+    #[test]
+    fn file_context_includes_all_when_within_budget() {
+        let files = vec![
+            FileContent {
+                filename: "a.rs".into(),
+                content: "small".into(),
+            },
+            FileContent {
+                filename: "b.rs".into(),
+                content: "also small".into(),
+            },
+        ];
+        let ctx = build_file_context(&files, 100_000);
+        assert!(ctx.contains("===== a.rs =====") && ctx.contains("===== b.rs ====="));
+        assert!(!ctx.contains("omitted"));
     }
 
     #[test]
