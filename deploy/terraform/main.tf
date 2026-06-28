@@ -17,6 +17,12 @@ data "aws_subnets" "default" {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+  # Only public subnets — the bootstrap user-data needs outbound HTTPS
+  # (Secrets Manager, GHCR, ACME, Gemini) from t=0.
+  filter {
+    name   = "map-public-ip-on-launch"
+    values = ["true"]
+  }
 }
 
 # ── Security group ──────────────────────────────────────────────────────────
@@ -153,11 +159,15 @@ resource "aws_iam_instance_profile" "nogent" {
 
 # ── Instance ────────────────────────────────────────────────────────────────
 resource "aws_instance" "nogent" {
-  ami                    = data.aws_ssm_parameter.al2023.value
-  instance_type          = var.instance_type
-  subnet_id              = data.aws_subnets.default.ids[0]
-  vpc_security_group_ids = [aws_security_group.nogent.id]
-  iam_instance_profile   = aws_iam_instance_profile.nogent.name
+  ami                         = data.aws_ssm_parameter.al2023.value
+  instance_type               = var.instance_type
+  subnet_id                   = data.aws_subnets.default.ids[0]
+  vpc_security_group_ids      = [aws_security_group.nogent.id]
+  iam_instance_profile        = aws_iam_instance_profile.nogent.name
+  # Auto-assign a public IP at launch so user-data has outbound from t=0,
+  # regardless of the subnet's MapPublicIpOnLaunch. The EIP attached below
+  # then swaps it in for stable addressing.
+  associate_public_ip_address = true
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
     region              = var.region
