@@ -62,7 +62,7 @@ pub fn build_digest(files: &[ChangedFile], max_files: usize, max_patch_bytes: us
     let mut sections: Vec<String> = Vec::with_capacity(selected.len());
     for f in selected {
         let patch = match &f.patch {
-            Some(p) => truncate_on_char_boundary(p, per_file_budget),
+            Some(p) => annotate_patch(&truncate_on_char_boundary(p, per_file_budget)),
             None => "[no text patch available]".to_string(),
         };
         sections.push(format!(
@@ -78,11 +78,120 @@ pub fn build_digest(files: &[ChangedFile], max_files: usize, max_patch_bytes: us
     }
 }
 
+/// Annotate each line of a unified-diff hunk with the **new-side line number**
+/// as a `L<n>` prefix. Removed (`-`) lines have no new-side number and get a
+/// blank-width prefix so the column stays aligned.
+///
+/// Why: models reading raw unified diffs have to mentally count from each
+/// `@@ -a,b +c,d @@` header to determine the line number of each line, and
+/// that count drifts across multi-hunk / multi-file diffs — producing inline
+/// review comments anchored at the wrong line. Pre-annotating removes the
+/// counting step: the model copies `L<n>` into the finding's `line` field.
+#[must_use]
+pub fn annotate_patch(patch: &str) -> String {
+    let mut out = String::with_capacity(patch.len() + patch.len() / 8);
+    let mut new_line: u64 = 0;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("@@") {
+            // Pass the header through; reset new-side counter from "+c[,d]".
+            out.push_str(line);
+            out.push('\n');
+            if let Some(plus) = rest.split('+').nth(1) {
+                let num: String = plus
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                new_line = num.parse().unwrap_or(0);
+            }
+            continue;
+        }
+        match line.chars().next() {
+            Some('+') => {
+                if new_line > 0 {
+                    out.push_str(&format!("L{new_line:<6} "));
+                    new_line += 1;
+                } else {
+                    out.push_str("        ");
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            Some('-') => {
+                // Removed line has no new-side number — keep column alignment.
+                out.push_str("        ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {
+                // Context or blank line — advances the new side, commentable.
+                if new_line > 0 {
+                    out.push_str(&format!("L{new_line:<6} "));
+                    new_line += 1;
+                } else {
+                    out.push_str("        ");
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffDigest {
     pub text: String,
     pub files_included: usize,
     pub total_files: usize,
+}
+
+/// Map each changed file to a `line_number → line_content` table for the
+/// new-side (RIGHT) lines visible in the diff. Content has the diff marker
+/// (`+`, ` `) stripped. Used by the listener to verify that the model's
+/// reported line actually contains the code the finding talks about — and to
+/// snap to a nearby line if it doesn't.
+#[must_use]
+pub fn line_content_by_file(files: &[ChangedFile]) -> BTreeMap<String, BTreeMap<u64, String>> {
+    let mut out = BTreeMap::new();
+    for f in files {
+        let Some(patch) = &f.patch else { continue };
+        let mut content: BTreeMap<u64, String> = BTreeMap::new();
+        let mut new_line: u64 = 0;
+        for line in patch.lines() {
+            if let Some(rest) = line.strip_prefix("@@") {
+                if let Some(plus) = rest.split('+').nth(1) {
+                    let num: String = plus
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    new_line = num.parse().unwrap_or(0);
+                }
+                continue;
+            }
+            match line.chars().next() {
+                Some('+') | Some(' ') => {
+                    if new_line > 0 {
+                        content.insert(new_line, line.get(1..).unwrap_or("").to_string());
+                    }
+                    new_line += 1;
+                }
+                Some('-') => { /* removed, no new-side line */ }
+                _ => {
+                    // Blank or unknown — treat as context.
+                    if new_line > 0 {
+                        content.insert(new_line, String::new());
+                    }
+                    new_line += 1;
+                }
+            }
+        }
+        if !content.is_empty() {
+            out.insert(f.filename.clone(), content);
+        }
+    }
+    out
 }
 
 /// Map each changed file to the set of new-side (RIGHT) line numbers that fall
@@ -247,6 +356,46 @@ mod tests {
     fn no_truncation_when_within_budget() {
         let out = truncate_on_char_boundary("hello", 100);
         assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn annotate_patch_prefixes_new_side_line_numbers() {
+        let patch = "@@ -1,3 +10,5 @@\n line_10\n-removed\n+line_11\n+line_12\n line_13\n";
+        let out = annotate_patch(patch);
+        assert!(out.contains("@@ -1,3 +10,5 @@"));
+        assert!(out.contains("L10"));
+        assert!(out.contains("L11"));
+        assert!(out.contains("L12"));
+        assert!(out.contains("L13"));
+        // Removed lines have no new-side number.
+        for line in out.lines() {
+            if line.contains("-removed") {
+                assert!(!line.contains('L'));
+            }
+        }
+    }
+
+    #[test]
+    fn annotate_patch_resets_counter_per_hunk() {
+        let patch =
+            "@@ -1 +1,2 @@\n+first_a\n+first_b\n@@ -10 +100,2 @@\n+second_a\n+second_b\n";
+        let out = annotate_patch(patch);
+        assert!(out.contains("L1     "));
+        assert!(out.contains("L2     "));
+        assert!(out.contains("L100   "));
+        assert!(out.contains("L101   "));
+    }
+
+    #[test]
+    fn line_content_by_file_indexes_new_side() {
+        let patch = "@@ -1,2 +5,3 @@\n context\n-old\n+brand_new\n+another\n";
+        let files = vec![file("a.rs", Some(patch))];
+        let idx = line_content_by_file(&files);
+        let entries = idx.get("a.rs").expect("file present");
+        assert_eq!(entries.get(&5).map(String::as_str), Some("context"));
+        assert_eq!(entries.get(&6).map(String::as_str), Some("brand_new"));
+        assert_eq!(entries.get(&7).map(String::as_str), Some("another"));
+        assert!(!entries.values().any(|v| v == "old"));
     }
 
     #[test]

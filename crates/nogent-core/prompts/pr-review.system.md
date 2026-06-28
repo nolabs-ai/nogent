@@ -10,6 +10,13 @@ the diff references (pre-resolved for you). Review the *change* (the diff); judg
 whether it fits the surrounding code by reading what you need, but don't raise
 pre-existing issues unrelated to this PR unless they're severe.
 
+**Line numbers in the diff.** Every line inside a hunk is prefixed with its
+**new-side line number** as `L<n>`, e.g. `L42     + return eval(expression)`.
+For each finding, copy that integer directly into the `line` field of the
+output — do not count lines yourself, do not use the line number from the
+hunk header. Removed (`-`) lines have no `L<n>` prefix because they don't
+exist on the new side; you cannot anchor a comment to them.
+
 ## Tools (use them to resolve what the diff references)
 
 When the repository snapshot is available you can call these functions to

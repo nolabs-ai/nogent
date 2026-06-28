@@ -6,7 +6,7 @@
 //! of focused critique lenses (coverage/parity, sinks, bypass) to cut variance.
 
 use nogent_core::diff_digest::{
-    DiffDigest, build_digest, commentable_lines, referenced_identifiers,
+    DiffDigest, build_digest, commentable_lines, line_content_by_file, referenced_identifiers,
 };
 use nogent_core::error::Result;
 use nogent_core::events::{EventJob, JobKind};
@@ -118,13 +118,26 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
             // Anchor findings with a valid changed-line as inline comments; the
             // rest (no line, or a line outside the diff) go in the body so the
             // reviews POST never 422s on an un-commentable line.
+            //
+            // Defensive: even with line-annotated diffs, the model can still pick
+            // a line a few off — snap within ±2 to the nearest commentable line
+            // whose content matches a backtick-quoted code token from the
+            // description.
             let valid = commentable_lines(&files);
+            let line_content = line_content_by_file(&files);
             let mut inline: Vec<InlineComment> = Vec::new();
             let mut leftover = Vec::new();
             for f in &out.findings {
-                let anchored = f.line.filter(|l| {
-                    !f.file.is_empty() && valid.get(&f.file).is_some_and(|s| s.contains(l))
+                let snapped = f.line.and_then(|l| {
+                    if f.file.is_empty() {
+                        return None;
+                    }
+                    let commentable = valid.get(&f.file)?;
+                    let content = line_content.get(&f.file);
+                    Some(snap_to_token_match(l, commentable, content, &f.description))
                 });
+                let anchored = snapped
+                    .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
                 match anchored {
                     Some(line) => inline.push(InlineComment {
                         path: f.file.clone(),
@@ -393,6 +406,68 @@ fn concat_text(parts: &[Part]) -> String {
         .collect::<String>()
 }
 
+/// Window for the line-anchor safety net.
+const SNAP_WINDOW: u64 = 2;
+
+/// Return the model's `line` unchanged if its content matches a backtick-quoted
+/// token from the description, otherwise look ±`SNAP_WINDOW` lines for the
+/// first commentable line whose content does — handy when the model drifts a
+/// line or two from the true location.
+fn snap_to_token_match(
+    line: u64,
+    commentable: &std::collections::BTreeSet<u64>,
+    content: Option<&std::collections::BTreeMap<u64, String>>,
+    description: &str,
+) -> u64 {
+    let Some(content) = content else { return line };
+    let tokens = backticked_tokens(description);
+    if tokens.is_empty() {
+        return line;
+    }
+    let line_matches = |l: u64| -> bool {
+        content
+            .get(&l)
+            .map(|c| tokens.iter().any(|t| c.contains(t.as_str())))
+            .unwrap_or(false)
+    };
+    if line_matches(line) {
+        return line;
+    }
+    // Try ±1, ±2 — prefer closer offsets; on tie, prefer earlier line.
+    for offset in 1..=SNAP_WINDOW {
+        let below = line.saturating_sub(offset);
+        if below != line && commentable.contains(&below) && line_matches(below) {
+            return below;
+        }
+        let above = line.saturating_add(offset);
+        if above != line && commentable.contains(&above) && line_matches(above) {
+            return above;
+        }
+    }
+    line
+}
+
+/// Pull out the substrings between backticks in `s`, skipping empty/short
+/// tokens. Used by the snap heuristic — these are the bits of code the model
+/// most often quotes when describing a finding (`pickle.loads`, `eval`, …).
+fn backticked_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_tick = false;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch == '`' {
+            if in_tick && cur.len() >= 3 && !cur.contains('\n') {
+                out.push(cur.clone());
+            }
+            cur.clear();
+            in_tick = !in_tick;
+        } else if in_tick {
+            cur.push(ch);
+        }
+    }
+    out
+}
+
 /// Tool declarations exposed to the model.
 fn repo_tools() -> Vec<Tool> {
     vec![Tool {
@@ -498,5 +573,75 @@ fn dispatch_tool(index: &RepoIndex, call: &FunctionCall) -> Value {
             json!({"files": index.list_files(contains)})
         }
         other => json!({"error": format!("unknown tool: {other}")}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn backticked_tokens_extracts_code_quotes() {
+        let s = "Use `pickle.loads` on `request.get_data()` — RCE in `import_state`.";
+        let toks = backticked_tokens(s);
+        assert_eq!(toks, vec!["pickle.loads", "request.get_data()", "import_state"]);
+    }
+
+    #[test]
+    fn snap_keeps_line_when_already_matches() {
+        let commentable: BTreeSet<u64> = (1..=20).collect();
+        let mut content: BTreeMap<u64, String> = BTreeMap::new();
+        content.insert(12, "    return eval(expression)".into());
+        let desc = "uses `eval` on untrusted input";
+        assert_eq!(
+            snap_to_token_match(12, &commentable, Some(&content), desc),
+            12,
+        );
+    }
+
+    #[test]
+    fn snap_corrects_off_by_two_drift() {
+        let commentable: BTreeSet<u64> = (1..=20).collect();
+        let mut content: BTreeMap<u64, String> = BTreeMap::new();
+        content.insert(10, "def calculate(expression):".into());
+        content.insert(11, r#"    """evaluate""""#.into());
+        content.insert(12, "    return eval(expression)".into());
+        let desc = "the `calculate` function uses `eval` — RCE";
+        // Model said 10; the eval is at 12 (offset +2); should snap to 12.
+        // (10 also matches `calculate` though, so 10 wins as the original.)
+        assert_eq!(
+            snap_to_token_match(10, &commentable, Some(&content), desc),
+            10,
+        );
+        // Model said 14 (no token); within ±2 only 12 matches → snap to 12.
+        assert_eq!(
+            snap_to_token_match(14, &commentable, Some(&content), desc),
+            12,
+        );
+    }
+
+    #[test]
+    fn snap_keeps_line_when_no_match_in_window() {
+        let commentable: BTreeSet<u64> = (1..=20).collect();
+        let mut content: BTreeMap<u64, String> = BTreeMap::new();
+        content.insert(5, "unrelated".into());
+        let desc = "uses `eval` — RCE";
+        assert_eq!(
+            snap_to_token_match(5, &commentable, Some(&content), desc),
+            5,
+        );
+    }
+
+    #[test]
+    fn snap_no_op_without_backtick_tokens() {
+        let commentable: BTreeSet<u64> = (1..=10).collect();
+        let mut content: BTreeMap<u64, String> = BTreeMap::new();
+        content.insert(3, "eval(x)".into());
+        let desc = "no backticks in this description at all";
+        assert_eq!(
+            snap_to_token_match(7, &commentable, Some(&content), desc),
+            7,
+        );
     }
 }
