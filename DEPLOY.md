@@ -280,7 +280,9 @@ reviewer's instructions.
 
 ## 8. Operations
 
-- **Logs:** `journalctl -u nogent-listener -f`. Get a shell with
+- **Logs:** `journalctl -u nogent-listener -f`. Each review/triage logs a
+  `gemini token usage` line (`tokens_in`, `tokens_out`, `thinking_tokens`,
+  `gemini_calls`) for cost tracking. Get a shell with
   `aws ssm start-session --target <instance-id>` — no SSH needed.
 - **Secret rotation:** update the Secrets Manager value (or `/etc/nogent/*`),
   then restart the listener container (`docker compose restart nogent`) —

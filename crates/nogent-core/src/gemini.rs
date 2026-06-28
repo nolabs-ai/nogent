@@ -233,13 +233,35 @@ struct Candidate {
     content: Option<RespContent>,
 }
 
+/// Per-call token accounting from Gemini. `thoughts_token_count` is the
+/// reasoning tokens (billed as output) on thinking models.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    pub prompt_token_count: u64,
+    #[serde(rename = "candidatesTokenCount", default)]
+    pub candidates_token_count: u64,
+    #[serde(rename = "thoughtsTokenCount", default)]
+    pub thoughts_token_count: u64,
+    #[serde(rename = "totalTokenCount", default)]
+    pub total_token_count: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenerateResponse {
     #[serde(default)]
     candidates: Vec<Candidate>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<UsageMetadata>,
 }
 
 impl GenerateResponse {
+    /// Token usage for this call, if the API reported it.
+    #[must_use]
+    pub fn usage(&self) -> Option<&UsageMetadata> {
+        self.usage_metadata.as_ref()
+    }
+
     /// Parts of the first candidate (text and/or functionCall).
     #[must_use]
     pub fn first_parts(&self) -> Vec<Part> {
@@ -328,6 +350,17 @@ mod tests {
         assert_eq!(call.name, "grep");
         assert_eq!(call.id.as_deref(), Some("call_1"));
         assert_eq!(call.args["pattern"], "fn add");
+    }
+
+    #[test]
+    fn parses_usage_metadata() {
+        let raw = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],
+            "usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":300,"thoughtsTokenCount":450,"totalTokenCount":1950}}"#;
+        let r: GenerateResponse = serde_json::from_str(raw).expect("parse");
+        let u = r.usage().expect("usage");
+        assert_eq!(u.prompt_token_count, 1200);
+        assert_eq!(u.candidates_token_count, 300);
+        assert_eq!(u.thoughts_token_count, 450);
     }
 
     #[test]

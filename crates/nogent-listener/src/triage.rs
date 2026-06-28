@@ -47,6 +47,14 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
 
     gh.post_issue_comment(&job.owner, &job.repo, job.number, &body)
         .await?;
-    tracing::info!(issue = job.number, "posted issue triage");
+    let u = gemini.usage();
+    tracing::info!(
+        issue = job.number,
+        gemini_calls = u.calls,
+        tokens_in = u.input_tokens,
+        tokens_out = u.output_tokens,
+        thinking_tokens = u.thinking_tokens,
+        "posted issue triage"
+    );
     Ok(())
 }

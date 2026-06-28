@@ -118,8 +118,9 @@ GEMINI_API_KEY=<key> RUST_LOG=info \
 ```
 
 It indexes the repo at `--repo`, feeds the diff to the model, logs each tool call
-(`grep`/`read_file`/`list_files`) as it navigates, and prints the Markdown
-review. `--diff -` reads the diff from stdin. `GEMINI_MODEL` (default
+(`grep`/`read_file`/`list_files`) as it navigates, prints a token-usage line
+(`tokens: in=… out=… thinking=… (calls=…)`), and prints the Markdown review.
+`--diff -` reads the diff from stdin. `GEMINI_MODEL` (default
 `gemini-3.5-flash`) and `GEMINI_THINKING_LEVEL` (default `high`) override the
 model and reasoning effort.
 

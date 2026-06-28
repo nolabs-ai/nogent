@@ -146,6 +146,15 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
                 .await?;
         }
     }
+    let u = gemini.usage();
+    tracing::info!(
+        pr = job.number,
+        gemini_calls = u.calls,
+        tokens_in = u.input_tokens,
+        tokens_out = u.output_tokens,
+        thinking_tokens = u.thinking_tokens,
+        "gemini token usage"
+    );
     Ok(())
 }
 
@@ -228,6 +237,11 @@ pub async fn run_local(
     let user = pr_review::user_prompt(&job, &digest, "");
     let gemini = GeminiClient::new(api_key, model, thinking_level)?;
     let raw = run_agentic(&gemini, &system, &user, index).await?;
+    let u = gemini.usage();
+    eprintln!(
+        "tokens: in={} out={} thinking={} (calls={})",
+        u.input_tokens, u.output_tokens, u.thinking_tokens, u.calls
+    );
     Ok(match validate_pr_review(&raw, &canary) {
         Some(out) => format_pr_review_markdown(&out),
         None => {

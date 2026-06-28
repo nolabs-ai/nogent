@@ -2,10 +2,29 @@
 //! API key. Supports single-turn text (triage) and multi-turn tool-calling
 //! (agentic review).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use nogent_core::error::{NogentError, Result};
 use nogent_core::gemini::{Content, GenerateRequest, GenerateResponse, Part, Tool};
 
 const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
+
+/// Accumulated token usage across all calls in one review/triage session.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageSnapshot {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+}
+
+#[derive(Default)]
+struct Usage {
+    calls: AtomicU64,
+    input: AtomicU64,
+    output: AtomicU64,
+    thinking: AtomicU64,
+}
 
 pub struct GeminiClient {
     http: reqwest::Client,
@@ -13,6 +32,7 @@ pub struct GeminiClient {
     model: String,
     /// Reasoning level (e.g. "high") for thinking-capable models; None to omit.
     thinking_level: Option<String>,
+    usage: Usage,
 }
 
 impl GeminiClient {
@@ -23,7 +43,19 @@ impl GeminiClient {
             api_key: api_key.to_string(),
             model: model.to_string(),
             thinking_level: thinking_level.map(str::to_string),
+            usage: Usage::default(),
         })
+    }
+
+    /// Total token usage across every call this client has made.
+    #[must_use]
+    pub fn usage(&self) -> UsageSnapshot {
+        UsageSnapshot {
+            calls: self.usage.calls.load(Ordering::Relaxed),
+            input_tokens: self.usage.input.load(Ordering::Relaxed),
+            output_tokens: self.usage.output.load(Ordering::Relaxed),
+            thinking_tokens: self.usage.thinking.load(Ordering::Relaxed),
+        }
     }
 
     async fn post(&self, req: &GenerateRequest) -> Result<GenerateResponse> {
@@ -43,7 +75,20 @@ impl GeminiClient {
                 body,
             });
         }
-        serde_json::from_str(&body).map_err(NogentError::from)
+        let parsed: GenerateResponse = serde_json::from_str(&body).map_err(NogentError::from)?;
+        self.usage.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(u) = parsed.usage() {
+            self.usage
+                .input
+                .fetch_add(u.prompt_token_count, Ordering::Relaxed);
+            self.usage
+                .output
+                .fetch_add(u.candidates_token_count, Ordering::Relaxed);
+            self.usage
+                .thinking
+                .fetch_add(u.thoughts_token_count, Ordering::Relaxed);
+        }
+        Ok(parsed)
     }
 
     /// Single-turn: system + user prompt, no tools. Returns the response text.
