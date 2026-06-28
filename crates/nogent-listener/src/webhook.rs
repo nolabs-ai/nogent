@@ -116,10 +116,12 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     let ev: nogent_core::events::IssueCommentEvent = serde_json::from_slice(body)
         .map_err(|e| nogent_core::NogentError::Payload(format!("issue_comment: {e}")))?;
 
-    // Only created/edited comments, only on PRs, only the exact command.
+    // Only created/edited comments, only on PRs, only the exact command,
+    // and not from a bot (prevents loops where another bot echoes the command).
     if !matches!(ev.action.as_str(), "created" | "edited")
         || ev.issue.pull_request.is_none()
         || !events::is_review_command(&ev.comment.body)
+        || ev.comment.user.is_bot()
     {
         return Ok(());
     }
@@ -151,6 +153,12 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
 
     if !events::is_actionable_pr_action(&ev.action) || ev.pull_request.draft {
         tracing::debug!(%delivery, action = %ev.action, draft = ev.pull_request.draft, "skipping PR");
+        return Ok(());
+    }
+    // Skip bot-authored PRs (dependabot, renovate, etc.). A maintainer who
+    // genuinely wants one reviewed can still trigger it with `/nogent review`.
+    if ev.pull_request.user.is_bot() {
+        tracing::info!(%delivery, author = %ev.pull_request.user.login, "skipping bot-authored PR");
         return Ok(());
     }
     let Some((owner, repo)) = ev.repository.owner_repo() else {

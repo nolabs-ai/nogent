@@ -109,19 +109,48 @@ fn one_line(s: &str) -> String {
     collapsed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `[sev · cat]` badge, e.g. `**[HIGH · security]**`. Either part may be absent.
+/// Category icon for quick visual scanning. Falls back to a neutral marker for
+/// unknown categories so the rendering is never empty.
+fn category_emoji(cat: &str) -> &'static str {
+    match cat.trim().to_lowercase().as_str() {
+        "security" => "🔒",
+        "bug" => "🐛",
+        "design" => "🏗️",
+        "tests" => "🧪",
+        "perf" => "⚡",
+        "nit" => "💬",
+        _ => "📝",
+    }
+}
+
+/// Map severity to a GitHub-flavored markdown alert keyword. GitHub renders
+/// `> [!CAUTION]` / `> [!WARNING]` / `> [!NOTE]` as colored alert blocks
+/// (red / orange / blue) with an icon — used for inline comments. `None` for
+/// unknown severities falls back to a plain comment body without an alert.
+fn severity_alert(sev: &str) -> Option<&'static str> {
+    match sev.trim().to_lowercase().as_str() {
+        "high" => Some("CAUTION"),
+        "medium" => Some("WARNING"),
+        "low" => Some("NOTE"),
+        _ => None,
+    }
+}
+
+/// `🔒 **[HIGH · security]** ` badge prefix. Either severity or category may be
+/// absent; the emoji is included whenever the category is present.
 fn finding_badge(f: &Finding) -> String {
     let sev = f.severity.trim().to_uppercase();
     let cat = f.category.trim_matches(['[', ']']);
     match (sev.is_empty(), cat.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!("**[{sev}]** "),
-        (true, false) => format!("**[{cat}]** "),
-        (false, false) => format!("**[{sev} · {cat}]** "),
+        (true, false) => format!("{} **[{cat}]** ", category_emoji(cat)),
+        (false, false) => format!("{} **[{sev} · {cat}]** ", category_emoji(cat)),
     }
 }
 
-/// `**[sev · cat]** \`file:line\` — description` — for a finding listed in the body.
+/// `🔒 **[sev · cat]** \`file:line\` — description` — for a finding listed in
+/// the body. Stays single-line so a bullet list reads cleanly.
 #[must_use]
 pub fn finding_list_item(f: &Finding) -> String {
     let mut s = String::from("- ");
@@ -136,11 +165,16 @@ pub fn finding_list_item(f: &Finding) -> String {
     s
 }
 
-/// `**[sev · cat]** description` — body for an inline comment (the file/line
-/// anchor the comment, so they're omitted from the text).
+/// Inline-comment body — wrapped in a GitHub markdown alert block keyed off
+/// severity (CAUTION/WARNING/NOTE → red/orange/blue stripe). The file/line are
+/// implicit in the comment anchor so they're omitted from the text.
 #[must_use]
 pub fn finding_inline_body(f: &Finding) -> String {
-    format!("{}{}", finding_badge(f), one_line(&f.description))
+    let content = format!("{}{}", finding_badge(f), one_line(&f.description));
+    match severity_alert(&f.severity) {
+        Some(level) => format!("> [!{level}]\n> {content}"),
+        None => content,
+    }
 }
 
 /// Best-effort recovery of findings from a possibly-truncated review (the JSON
@@ -561,7 +595,15 @@ mod tests {
         assert!(!item.contains('\n') && !item.contains('\r') && !item.contains('\t'));
         assert!(item.contains("**[HIGH · security]**"));
         assert!(item.contains("`a.rs:9`"));
-        assert!(finding_inline_body(&f).lines().count() == 1);
+        assert!(item.contains("🔒"));
+
+        let inline = finding_inline_body(&f);
+        let content = inline
+            .strip_prefix("> [!CAUTION]\n> ")
+            .expect("high severity must use CAUTION alert block");
+        assert!(!content.contains('\n') && !content.contains('\r') && !content.contains('\t'));
+        assert!(content.contains("**[HIGH · security]**"));
+        assert!(content.contains("🔒"));
     }
 
     #[test]

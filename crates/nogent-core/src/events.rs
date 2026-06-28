@@ -16,6 +16,19 @@ pub struct Installation {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Actor {
     pub login: String,
+    /// GitHub user type — typically `"User"` or `"Bot"`. Missing on some
+    /// payload shapes (older fixtures, embedded users), treated as `"User"`.
+    #[serde(default, rename = "type")]
+    pub user_type: String,
+}
+
+impl Actor {
+    /// True if this actor is a GitHub App / Bot account — used to skip
+    /// auto-review of dependabot/renovate/etc. PRs by default.
+    #[must_use]
+    pub fn is_bot(&self) -> bool {
+        self.user_type.eq_ignore_ascii_case("bot")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +220,18 @@ mod tests {
         assert_eq!(ev.pull_request.user.login, "alice");
         assert_eq!(ev.pull_request.head.ref_name, "feature");
         assert!(ev.pull_request.body.is_none());
+    }
+
+    #[test]
+    fn actor_type_drives_is_bot() {
+        let human: Actor = serde_json::from_str(r#"{"login":"alice","type":"User"}"#).unwrap();
+        let bot: Actor = serde_json::from_str(r#"{"login":"dependabot[bot]","type":"Bot"}"#).unwrap();
+        let bot_lower: Actor = serde_json::from_str(r#"{"login":"x","type":"bot"}"#).unwrap();
+        let missing: Actor = serde_json::from_str(r#"{"login":"legacy"}"#).unwrap();
+        assert!(!human.is_bot());
+        assert!(bot.is_bot());
+        assert!(bot_lower.is_bot());
+        assert!(!missing.is_bot()); // default → "" → treated as human
     }
 
     #[test]
