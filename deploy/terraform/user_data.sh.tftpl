@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # nogent bootstrap (container deploy). Terraform interpolations are $${...}-escaped
-# where they are bash variables; bare ${...} are Terraform template values.
+# where they are bash variables; bare $${...} are Terraform template values.
 set -euo pipefail
 exec > >(tee -a /var/log/nogent-bootstrap.log) 2>&1
 echo "=== nogent bootstrap $(date -u) ==="
