@@ -1,0 +1,4 @@
+/target
+.env
+*.pem
+!crates/nogent-listener/testdata/test_rsa_key.pem

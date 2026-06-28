@@ -1,0 +1,49 @@
+# nogent on a single host: the listener container behind a Caddy container that
+# terminates TLS. Run with `docker compose up -d` (or `podman compose`).
+#
+# Host prerequisites (see ../DEPLOY.md):
+#   /etc/nogent/nogent.env          — config + secrets (0600), incl.
+#                                     GITHUB_APP_PRIVATE_KEY_FILE=/etc/nogent/app-private-key.pem
+#   /etc/nogent/app-private-key.pem — the App private key (0600)
+#   ./Caddyfile                     — replace the domain + email
+#
+# Pin IMAGE_TAG to a released tag in production (e.g. export IMAGE_TAG=0.1.0).
+
+services:
+  nogent:
+    image: ghcr.io/nolabs-ai/nogent:${IMAGE_TAG:-latest}
+    # Bind all interfaces *inside the container*; only Caddy can reach it via
+    # the internal network — the port is not published to the host.
+    environment:
+      NOGENT_BIND_ADDR: "0.0.0.0:8080"
+    env_file:
+      - /etc/nogent/nogent.env
+    volumes:
+      - /etc/nogent:/etc/nogent:ro
+    expose:
+      - "8080"
+    networks:
+      - internal
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on:
+      - nogent
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - internal
+    restart: unless-stopped
+
+networks:
+  internal:
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,24 @@
+# Caddy config for the compose deploy. Caddy reaches the listener over the
+# compose network by service name (`nogent:8080`), not loopback.
+#
+# Replace the domain and email before use.
+
+{
+	email ops@example.com
+}
+
+nogent.example.com {
+	encode gzip
+
+	@app path /api/github/webhooks /healthz
+	handle @app {
+		reverse_proxy nogent:8080
+	}
+	handle {
+		respond "not found" 404
+	}
+
+	request_body {
+		max_size 2MB
+	}
+}

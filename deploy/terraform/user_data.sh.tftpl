@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# nogent bootstrap (container deploy). Terraform interpolations are $${...}-escaped
+# where they are bash variables; bare ${...} are Terraform template values.
+set -euo pipefail
+exec > >(tee -a /var/log/nogent-bootstrap.log) 2>&1
+echo "=== nogent bootstrap $(date -u) ==="
+
+# 1. Packages: docker + compose plugin, jq (secret parsing), chrony (clock).
+dnf install -y docker jq chrony
+systemctl enable --now chronyd
+systemctl enable --now docker
+# compose v2 plugin
+mkdir -p /usr/libexec/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
+
+# 2. Secrets → files. Private key as a 0600 file (multi-line PEM); webhook
+#    secret + Gemini key into the env file.
+install -d -m 0750 /etc/nogent
+SECRET_JSON="$(aws secretsmanager get-secret-value \
+  --region ${region} --secret-id ${secret_arn} \
+  --query SecretString --output text)"
+
+umask 077
+echo "$${SECRET_JSON}" | jq -r '.github_app_private_key' > /etc/nogent/app-private-key.pem
+GH_WEBHOOK_SECRET="$(echo "$${SECRET_JSON}" | jq -r '.github_webhook_secret')"
+GEMINI_API_KEY="$(echo "$${SECRET_JSON}" | jq -r '.gemini_api_key')"
+
+cat > /etc/nogent/nogent.env <<EOF
+GITHUB_APP_ID=${github_app_id}
+GITHUB_APP_PRIVATE_KEY_FILE=/etc/nogent/app-private-key.pem
+GITHUB_WEBHOOK_SECRET=$${GH_WEBHOOK_SECRET}
+GEMINI_API_KEY=$${GEMINI_API_KEY}
+GEMINI_MODEL=${gemini_model}
+RUST_LOG=info
+EOF
+chmod 0600 /etc/nogent/app-private-key.pem /etc/nogent/nogent.env
+
+# 3. Optional private-registry login.
+if [ -n "${image_registry_auth}" ]; then
+  echo "${image_registry_auth}" | cut -d: -f2- | \
+    docker login "$(echo '${image}' | cut -d/ -f1)" \
+      -u "$(echo '${image_registry_auth}' | cut -d: -f1)" --password-stdin
+fi
+
+# 4. Compose project (listener + Caddy). Caddy is the only public listener.
+install -d -m 0755 /opt/nogent
+cat > /opt/nogent/Caddyfile <<EOF
+{
+	email ${acme_email}
+}
+${domain} {
+	encode gzip
+	@app path /api/github/webhooks /healthz
+	handle @app {
+		reverse_proxy nogent:8080
+	}
+	handle {
+		respond "not found" 404
+	}
+	request_body {
+		max_size 2MB
+	}
+}
+EOF
+
+cat > /opt/nogent/compose.yaml <<EOF
+services:
+  nogent:
+    image: ${image}
+    environment:
+      NOGENT_BIND_ADDR: "0.0.0.0:8080"
+    env_file:
+      - /etc/nogent/nogent.env
+    volumes:
+      - /etc/nogent:/etc/nogent:ro
+    expose:
+      - "8080"
+    networks: [internal]
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    depends_on: [nogent]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /opt/nogent/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [internal]
+    restart: unless-stopped
+networks:
+  internal:
+volumes:
+  caddy_data:
+  caddy_config:
+EOF
+
+# 5. Up.
+docker compose -f /opt/nogent/compose.yaml pull
+docker compose -f /opt/nogent/compose.yaml up -d
+echo "=== nogent bootstrap complete ==="

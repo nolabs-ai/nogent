@@ -1,0 +1,16 @@
+{
+  "name": "nogent",
+  "url": "https://github.com/nolabs-ai/nogent",
+  "hook_attributes": {
+    "url": "https://REPLACE_ME/api/github/webhooks"
+  },
+  "redirect_url": "https://REPLACE_ME/setup",
+  "public": false,
+  "default_permissions": {
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  },
+  "default_events": ["pull_request", "issues"]
+}

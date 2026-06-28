@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "issueTriage": {
+    "enabled": true
+  },
+  "pullRequestSecurityReview": {
+    "enabled": true,
+    "maxFiles": 25,
+    "maxPatchBytes": 120000
+  },
+  "additionalPolicyPaths": [
+    ".github/security-policies",
+    ".nogent/policies"
+  ]
+}

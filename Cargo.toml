@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nogent-core",
+    "crates/nogent-listener",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/nolabs-ai/nogent"
+
+[workspace.dependencies]
+# Async runtime. The listener also uses tokio::process to spawn `nono run`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "net", "io-util", "fs"] }
+# Webhook HTTP server (matches nono-gateway's framework choice).
+axum = { version = "0.7", features = ["macros"] }
+# Request tracing + a hard body-size limit on the webhook endpoint.
+tower-http = { version = "0.6", features = ["trace", "limit"] }
+# RS256 GitHub App JWT signing.
+jsonwebtoken = "9"
+# Constant-time HMAC-SHA256 verification of X-Hub-Signature-256.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+# HTTP client to GitHub + Gemini. rustls so we do not depend on system OpenSSL on EC2.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Hold the App private key, webhook secret, Gemini key and minted tokens in zeroizing memory.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Validate generated endpoint_rules globs before spawning the worker (same crate nono's proxy compiles them with).
+globset = "0.4"
+# Canary generation.
+rand = "0.8"
+hex = "0.4"
+# Load config from .env in dev.
+dotenvy = "0.15"
+
+nogent-core = { path = "crates/nogent-core" }
+
+[profile.release]
+lto = "thin"
+strip = true

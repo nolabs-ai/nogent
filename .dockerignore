@@ -1,0 +1,10 @@
+# Keep the build context small and free of secrets.
+/target
+**/target
+.git
+.env
+*.pem
+!crates/nogent-listener/testdata/test_rsa_key.pem
+deploy/terraform/.terraform
+deploy/terraform/*.tfstate*
+deploy/terraform/terraform.tfvars

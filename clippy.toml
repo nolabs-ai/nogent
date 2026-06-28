@@ -1,0 +1,9 @@
+# Mirrors nono's lint posture. Production code must never unwrap/expect;
+# tests may, since a panicking assertion there is the intended failure mode.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "env var mutation is not thread-safe across parallel tests" },
+    { path = "std::env::remove_var", reason = "env var mutation is not thread-safe across parallel tests" },
+]

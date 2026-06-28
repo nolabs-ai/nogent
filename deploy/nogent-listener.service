@@ -1,0 +1,34 @@
+# systemd unit for the nogent listener.
+#
+# The listener holds the real secrets and does the PR review / issue triage
+# in-process. This unit hardens it.
+#
+# Install: /etc/systemd/system/nogent-listener.service
+# Secrets: /etc/nogent/nogent.env (mode 0600, owned by the service user),
+#          ideally rendered at boot from AWS Secrets Manager.
+
+[Unit]
+Description=nogent GitHub App listener (AI PR review + issue triage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nogent
+Group=nogent
+EnvironmentFile=/etc/nogent/nogent.env
+ExecStart=/usr/local/bin/nogent-listener
+Restart=on-failure
+RestartSec=2
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
