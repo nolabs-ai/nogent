@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="nogent" width="200" />
+</p>
+
 # nogent
 
 `nogent` is a GitHub App that runs AI-powered **PR security review** and
@@ -24,13 +28,18 @@ secret.
 **Triggers.** A PR is reviewed once when it's **opened / reopened / marked
 ready** (not on every push — that would be noisy). To re-review the latest
 commit, comment **`/nogent review`** on the PR. Issues are triaged on
-open/edit/reopen.
+open/edit/reopen. PRs authored by **bots** (`dependabot`, `renovate`,
+`github-actions[bot]`, …) are skipped by default so a routine bump doesn't burn
+a review — comment `/nogent review` to force one.
 
 **Output.** Findings are ranked by **severity** (`high → medium → low`) and
-carry a `[SEV · category]` badge. Those with a line in the diff are posted as
-**inline review comments** anchored to that line; anything not tied to a changed
-line goes in the review body alongside the one-line summary. It's a `COMMENT`
-review — advisory, never blocking.
+carry a category emoji (🔒 security, 🐛 bug, 🏗️ design, 🧪 tests, ⚡ perf,
+💬 nit) plus a `[SEV · category]` badge. Each finding with a line in the diff
+is posted as an **inline review comment** anchored to that line and rendered as
+a GitHub markdown **alert block** keyed off severity — `> [!CAUTION]` /
+`> [!WARNING]` / `> [!NOTE]` (red / orange / blue stripe). Findings that can't
+be anchored go in the review body alongside the one-line summary. It's a
+`COMMENT` review — advisory, never blocking.
 
 Defenses that matter for a bot ingesting attacker-controlled input (diffs,
 titles, issue bodies, and the model's own response):
@@ -43,6 +52,42 @@ titles, issue bodies, and the model's own response):
 - **Least-privilege App permissions** (`contents:read`, `issues:write`,
   `pull_requests:write`, `metadata:read`).
 - **Bounded diffs** (`maxFiles`/`maxPatchBytes`) and **fail-secure config**.
+- **Bot-PR skip** — automated PRs from dependabot/renovate/etc. are ignored by
+  default; a human comment is required to opt them in.
+
+## Security & hardening
+
+In addition to the app-layer defenses above, the published image and the
+reference AWS deployment are hardened end-to-end:
+
+**Container image** (`ghcr.io/nolabs-ai/nogent:vX.Y.Z`):
+- Built from Chainguard's **distroless `glibc-dynamic`** — no shell, no package
+  manager, no busybox in the runtime layer.
+- Runs as **non-root** (uid `65532`).
+- TLS via **rustls + ring**, with Mozilla roots baked into the binary
+  (`webpki-roots`); no host CA trust, no OpenSSL in the runtime.
+- **Signed with cosign** (keyless, OIDC), with SBOM and SLSA-provenance
+  attestations published alongside each tagged release.
+
+**Host & infrastructure** (`deploy/terraform/`):
+- Secrets stored in **AWS Secrets Manager** and fetched at boot; never baked
+  into the image, never committed to git. The IAM role attached to the host
+  scopes `secretsmanager:GetSecretValue` to **one secret ARN**.
+- **No SSH** by default — administer over **SSM Session Manager**.
+- **IMDSv2 required** on the EC2 (blocks SSRF-style metadata theft).
+- Security group: only **80/443 ingress** (for ACME + webhooks); egress
+  restricted to HTTPS, DNS, and NTP.
+- Listener binds **127.0.0.1** behind **Caddy**, which handles automatic
+  Let's Encrypt TLS and is the only public surface.
+- Bootstrap places the PEM at `0640` owned by uid `65532` (readable only by
+  the container user) and the env file at `0600` root-only (read by the docker
+  daemon, never by the container).
+
+**Build & release pipeline** (`.github/workflows/image.yml`):
+- Branches and PRs **build the image** as a sanity check but never push to GHCR.
+- **Only `v*` tags publish** — push to GHCR, sign with cosign, attach SBOM and
+  provenance. This makes `terraform apply` against a tag a fully attestable
+  deploy.
 
 > **Planned hardening:** running the per-event work inside a
 > [nono](https://github.com/nolabs-ai/nono) sandbox so the process handling
@@ -137,6 +182,31 @@ manual), security-group ports, verification and operations — is in
 **[DEPLOY.md](DEPLOY.md)**. nogent ships as a container
 ([`docker/`](docker/), published to GHCR by CI); a Caddy container terminates
 TLS in front of it. Terraform lives in [`deploy/terraform/`](deploy/terraform/).
+
+## Release
+
+Releases are **tag-driven**. Pushes to `main` and PRs build the image to catch
+breakage but never publish; only a `v*` tag triggers a GHCR push.
+
+```bash
+# 1. Land changes on main; make sure tests + clippy are clean.
+make ci
+
+# 2. Tag and push — CI builds, signs (cosign keyless), and publishes
+#    ghcr.io/nolabs-ai/nogent:vX.Y.Z plus :X.Y plus :sha-<git-sha>.
+git tag vX.Y.Z
+git push origin vX.Y.Z
+
+# 3. Roll the deploy: update `image` in deploy/terraform/terraform.tfvars,
+#    then apply. `user_data_replace_on_change = true` recycles the EC2 with
+#    the new image; the EIP (and so the GitHub webhook URL) stays.
+cd deploy/terraform
+terraform apply
+```
+
+Tags are immutable in GHCR — pulling `vX.Y.Z` later always gets the same
+signed digest. The CI workflow attaches an SBOM and SLSA-provenance
+attestation to each published tag.
 
 ## License
 
