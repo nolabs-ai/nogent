@@ -2,3 +2,15 @@
 .env
 *.pem
 !crates/nogent-listener/testdata/test_rsa_key.pem
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars.local
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
