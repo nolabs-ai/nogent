@@ -81,11 +81,43 @@ pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOu
     Some(parsed)
 }
 
-/// Render a validated PR review as a Markdown comment body.
+const REVIEW_FOOTER: &str = "<sub>Automated code + security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>";
+
+/// `**[cat]** \`file:line\` — description` — for a finding listed in the body.
+#[must_use]
+pub fn finding_list_item(f: &Finding) -> String {
+    let cat = f.category.trim_matches(['[', ']']);
+    let mut s = String::from("- ");
+    if !cat.is_empty() {
+        s.push_str(&format!("**[{cat}]** "));
+    }
+    if !f.file.is_empty() {
+        match f.line {
+            Some(n) => s.push_str(&format!("`{}:{}` — ", f.file, n)),
+            None => s.push_str(&format!("`{}` — ", f.file)),
+        }
+    }
+    s.push_str(&f.description);
+    s
+}
+
+/// `**[cat]** description` — body for an inline comment (the file/line anchor
+/// the comment, so they're omitted from the text).
+#[must_use]
+pub fn finding_inline_body(f: &Finding) -> String {
+    let cat = f.category.trim_matches(['[', ']']);
+    if cat.is_empty() {
+        f.description.clone()
+    } else {
+        format!("**[{cat}]** {}", f.description)
+    }
+}
+
+/// Render a validated PR review as a single flat Markdown body (used by local
+/// eval, which prints to stdout rather than posting inline comments).
 #[must_use]
 pub fn format_pr_review_markdown(out: &PrReviewOutput) -> String {
-    let mut s = String::new();
-    s.push_str("## 🤖 nogent code review\n\n");
+    let mut s = String::from("## nogent code review\n\n");
     if !out.summary.is_empty() {
         s.push_str(&out.summary);
         s.push_str("\n\n");
@@ -95,24 +127,36 @@ pub fn format_pr_review_markdown(out: &PrReviewOutput) -> String {
     } else {
         s.push_str("**Findings:**\n\n");
         for f in &out.findings {
-            let cat = f.category.trim_matches(['[', ']']);
-            let mut line = String::from("- ");
-            if !cat.is_empty() {
-                line.push_str(&format!("**[{cat}]** "));
-            }
-            if !f.file.is_empty() {
-                match f.line {
-                    Some(n) => line.push_str(&format!("`{}:{}` — ", f.file, n)),
-                    None => line.push_str(&format!("`{}` — ", f.file)),
-                }
-            }
-            line.push_str(&f.description);
-            s.push_str(&line);
+            s.push_str(&finding_list_item(f));
             s.push('\n');
         }
         s.push('\n');
     }
-    s.push_str("<sub>Automated code + security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>");
+    s.push_str(REVIEW_FOOTER);
+    s
+}
+
+/// Review body for the GitHub path: summary + any findings that could NOT be
+/// anchored inline (`leftover`). `inline_count` lets us avoid the "none flagged"
+/// note when findings exist but are all inline.
+#[must_use]
+pub fn format_pr_review_body(summary: &str, leftover: &[Finding], inline_count: usize) -> String {
+    let mut s = String::from("## nogent code review\n\n");
+    if !summary.is_empty() {
+        s.push_str(summary);
+        s.push_str("\n\n");
+    }
+    if !leftover.is_empty() {
+        s.push_str("**Findings (not tied to a changed line):**\n\n");
+        for f in leftover {
+            s.push_str(&finding_list_item(f));
+            s.push('\n');
+        }
+        s.push('\n');
+    } else if inline_count == 0 {
+        s.push_str("**Findings:** none flagged in scope.\n\n");
+    }
+    s.push_str(REVIEW_FOOTER);
     s
 }
 

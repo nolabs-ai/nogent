@@ -87,7 +87,8 @@ settings → Developer settings → GitHub Apps → New**):
 | Pull requests | Read & write |
 | Metadata | Read-only (auto) |
 
-**Subscribe to events:** ✅ *Pull request*, ✅ *Issues*. Click **Create**.
+**Subscribe to events:** ✅ *Pull request*, ✅ *Issues*, ✅ *Issue comment*
+(the last is needed for the `/nogent review` re-review command). Click **Create**.
 
 (Values mirror [`deploy/github-app-manifest.json`](deploy/github-app-manifest.json)
 if you prefer the manifest flow; set `hook_attributes.url` + `redirect_url` first.)

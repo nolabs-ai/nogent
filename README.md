@@ -21,6 +21,16 @@ work on a detached task. The App authenticates as itself with its own
 installation token, so it reviews **fork PRs** without depending on any CI
 secret.
 
+**Triggers.** A PR is reviewed once when it's **opened / reopened / marked
+ready** (not on every push — that would be noisy). To re-review the latest
+commit, comment **`/nogent review`** on the PR. Issues are triaged on
+open/edit/reopen.
+
+**Output.** Findings with a line in the diff are posted as **inline review
+comments** anchored to that line; anything not tied to a changed line goes in the
+review body alongside the one-line summary. It's a `COMMENT` review — advisory,
+never blocking.
+
 Defenses that matter for a bot ingesting attacker-controlled input (diffs,
 titles, issue bodies, and the model's own response):
 

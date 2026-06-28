@@ -12,5 +12,5 @@
     "metadata": "read",
     "pull_requests": "write"
   },
-  "default_events": ["pull_request", "issues"]
+  "default_events": ["pull_request", "issues", "issue_comment"]
 }

@@ -7,6 +7,8 @@
 //! Unlike the original TypeScript (`Buffer.subarray`, which can split a UTF-8
 //! sequence mid-codepoint), the Rust truncation is codepoint-safe.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::Deserialize;
 
 /// A single changed file as returned by GitHub's "list pull request files" API.
@@ -81,6 +83,55 @@ pub struct DiffDigest {
     pub text: String,
     pub files_included: usize,
     pub total_files: usize,
+}
+
+/// Map each changed file to the set of new-side (RIGHT) line numbers that fall
+/// inside a diff hunk — the only lines GitHub will accept an inline review
+/// comment on. Added (`+`) and context (` `) lines count; removed (`-`) lines do
+/// not advance the new-side counter. A finding whose line isn't in this set must
+/// go in the review body, or the whole `reviews` POST is rejected (422).
+#[must_use]
+pub fn commentable_lines(files: &[ChangedFile]) -> BTreeMap<String, BTreeSet<u64>> {
+    let mut map = BTreeMap::new();
+    for f in files {
+        let Some(patch) = &f.patch else { continue };
+        let mut lines = BTreeSet::new();
+        let mut new_line: u64 = 0;
+        for hunk in patch.lines() {
+            if let Some(rest) = hunk.strip_prefix("@@") {
+                // "@@ -a,b +c,d @@" — start the new-side counter at c.
+                if let Some(plus) = rest.split('+').nth(1) {
+                    let num: String = plus
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    new_line = num.parse().unwrap_or(0);
+                }
+                continue;
+            }
+            match hunk.chars().next() {
+                Some('+') => {
+                    if new_line > 0 {
+                        lines.insert(new_line);
+                    }
+                    new_line += 1;
+                }
+                Some('-') => { /* removed: new side does not advance */ }
+                _ => {
+                    // context line (or empty) — commentable, advances new side
+                    if new_line > 0 {
+                        lines.insert(new_line);
+                    }
+                    new_line += 1;
+                }
+            }
+        }
+        if !lines.is_empty() {
+            map.insert(f.filename.clone(), lines);
+        }
+    }
+    map
 }
 
 /// Full post-change content of a changed file, for review context.
@@ -189,6 +240,25 @@ mod tests {
         assert!(ctx.contains("===== a.rs ====="));
         // Second file doesn't fit → noted as omitted.
         assert!(ctx.contains("omitted to fit the context budget"));
+    }
+
+    #[test]
+    fn commentable_lines_tracks_new_side() {
+        let patch = "@@ -1,3 +1,4 @@\n context1\n-old\n+new1\n+new2\n context2";
+        let files = vec![ChangedFile {
+            filename: "a.rs".into(),
+            status: "modified".into(),
+            additions: 2,
+            deletions: 1,
+            patch: Some(patch.into()),
+        }];
+        let map = commentable_lines(&files);
+        let lines = &map["a.rs"];
+        // context1=1, new1=2, new2=3, context2=4 are commentable on the new side.
+        assert!(
+            lines.contains(&1) && lines.contains(&2) && lines.contains(&3) && lines.contains(&4)
+        );
+        assert!(!lines.contains(&5));
     }
 
     #[test]

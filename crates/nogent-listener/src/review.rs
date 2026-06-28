@@ -4,12 +4,15 @@
 //! list_files) in a bounded agentic loop — so it can resolve symbols the diff
 //! references (e.g. find the definition of a called function).
 
-use nogent_core::diff_digest::{DiffDigest, FileContent, build_digest, build_file_context};
+use nogent_core::diff_digest::{
+    DiffDigest, FileContent, build_digest, build_file_context, commentable_lines,
+};
 use nogent_core::error::Result;
 use nogent_core::events::{EventJob, JobKind};
 use nogent_core::gemini::{Content, FunctionCall, FunctionDeclaration, Part, Tool};
 use nogent_core::output_validator::{
-    FALLBACK_MESSAGE, format_pr_review_markdown, generate_canary, validate_pr_review,
+    FALLBACK_MESSAGE, finding_inline_body, format_pr_review_body, format_pr_review_markdown,
+    generate_canary, validate_pr_review,
 };
 use nogent_core::prompts::pr_review;
 use nogent_core::repo_config::ResolvedConfig;
@@ -17,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::config::ListenerConfig;
 use crate::gemini_client::GeminiClient;
-use crate::github_client::GithubClient;
+use crate::github_client::{GithubClient, InlineComment};
 use crate::repo_index::RepoIndex;
 
 /// Agentic loop bounds.
@@ -99,25 +102,50 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         }
     };
 
-    let body = match validate_pr_review(&raw, &canary) {
-        Some(out) => format_pr_review_markdown(&out),
+    match validate_pr_review(&raw, &canary) {
+        Some(out) => {
+            // Anchor findings with a valid changed-line as inline comments; the
+            // rest (no line, or a line outside the diff) go in the body so the
+            // reviews POST never 422s on an un-commentable line.
+            let valid = commentable_lines(&files);
+            let mut inline: Vec<InlineComment> = Vec::new();
+            let mut leftover = Vec::new();
+            for f in &out.findings {
+                let anchored = f.line.filter(|l| {
+                    !f.file.is_empty() && valid.get(&f.file).is_some_and(|s| s.contains(l))
+                });
+                match anchored {
+                    Some(line) => inline.push(InlineComment {
+                        path: f.file.clone(),
+                        line,
+                        side: "RIGHT".to_string(),
+                        body: finding_inline_body(f),
+                    }),
+                    None => leftover.push(f.clone()),
+                }
+            }
+            let body = format_pr_review_body(&out.summary, &leftover, inline.len());
+            let inline_count = inline.len();
+            gh.post_pr_review_with_comments(&job.owner, &job.repo, job.number, &body, inline)
+                .await?;
+            tracing::info!(
+                pr = job.number,
+                files = digest.files_included,
+                inline = inline_count,
+                indexed_files = index.as_ref().map(RepoIndex::file_count).unwrap_or(0),
+                "posted PR review"
+            );
+        }
         None => {
             tracing::warn!(
                 pr = job.number,
                 raw = %raw.chars().take(6000).collect::<String>(),
                 "model output failed validation; posting fallback"
             );
-            FALLBACK_MESSAGE.to_string()
+            gh.post_pr_review(&job.owner, &job.repo, job.number, FALLBACK_MESSAGE)
+                .await?;
         }
-    };
-    gh.post_pr_review(&job.owner, &job.repo, job.number, &body)
-        .await?;
-    tracing::info!(
-        pr = job.number,
-        files = digest.files_included,
-        indexed_files = index.as_ref().map(RepoIndex::file_count).unwrap_or(0),
-        "posted PR review"
-    );
+    }
     Ok(())
 }
 

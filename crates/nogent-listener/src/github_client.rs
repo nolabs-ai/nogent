@@ -5,7 +5,17 @@
 
 use nogent_core::diff_digest::ChangedFile;
 use nogent_core::error::{NogentError, Result};
+use serde::Serialize;
 use serde_json::json;
+
+/// An inline review comment anchored to a line of the diff (new side).
+#[derive(Debug, Clone, Serialize)]
+pub struct InlineComment {
+    pub path: String,
+    pub line: u64,
+    pub side: String,
+    pub body: String,
+}
 
 const GITHUB_API: &str = "https://api.github.com";
 const ACCEPT: &str = "application/vnd.github+json";
@@ -118,6 +128,34 @@ impl GithubClient {
         }
     }
 
+    /// Fetch a pull request by number (for the `/nogent review` command, where
+    /// the webhook only gives us the issue/PR number).
+    pub async fn get_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<nogent_core::events::PullRequest> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}");
+        let resp = self
+            .http
+            .get(self.url(&path))
+            .header("Authorization", format!("token {}", self.token))
+            .header("Accept", ACCEPT)
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(NogentError::GitHubApi {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        serde_json::from_str(&body).map_err(NogentError::from)
+    }
+
     /// Read maintainer-authored review guidance from a TRUSTED ref (the base
     /// branch / base SHA — never the PR head, which a fork can modify). Tries
     /// `NOGENT.md` then `.github/nogent.md`. Bounded to `max_bytes`.
@@ -191,6 +229,25 @@ impl GithubClient {
         let path = format!("/repos/{owner}/{repo}/pulls/{number}/reviews");
         self.post_json(&path, &json!({ "event": "COMMENT", "body": body }))
             .await
+    }
+
+    /// Post a PR review with inline comments anchored to diff lines, plus an
+    /// overall body. Every comment's `line` MUST be within a diff hunk or GitHub
+    /// rejects the whole review (422) — callers filter via `commentable_lines`.
+    pub async fn post_pr_review_with_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+        comments: Vec<InlineComment>,
+    ) -> Result<()> {
+        let path = format!("/repos/{owner}/{repo}/pulls/{number}/reviews");
+        self.post_json(
+            &path,
+            &json!({ "event": "COMMENT", "body": body, "comments": comments }),
+        )
+        .await
     }
 
     /// Post a comment on an issue.

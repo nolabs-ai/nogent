@@ -92,13 +92,35 @@ pub struct IssueEvent {
     pub issue: Issue,
 }
 
-/// PR actions we act on. Drafts are skipped by the listener separately.
+/// PR actions we auto-review on. NOT `synchronize` — we review once when a PR
+/// appears; pushes are re-reviewed on demand via the `/nogent review` comment
+/// command instead of on every push.
 #[must_use]
 pub fn is_actionable_pr_action(action: &str) -> bool {
-    matches!(
-        action,
-        "opened" | "synchronize" | "reopened" | "ready_for_review"
-    )
+    matches!(action, "opened" | "reopened" | "ready_for_review")
+}
+
+/// A comment on an issue or PR (from the `issue_comment` event).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Comment {
+    #[serde(default)]
+    pub body: String,
+    pub user: Actor,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueCommentEvent {
+    pub action: String,
+    pub installation: Installation,
+    pub repository: Repository,
+    pub issue: Issue,
+    pub comment: Comment,
+}
+
+/// True if any line of the comment is exactly the `/nogent review` command.
+#[must_use]
+pub fn is_review_command(body: &str) -> bool {
+    body.lines().any(|l| l.trim() == "/nogent review")
 }
 
 /// Issue actions we act on.

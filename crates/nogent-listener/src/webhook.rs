@@ -57,7 +57,7 @@ pub async fn handle_webhook(
 
     match event.as_str() {
         "ping" => StatusCode::OK,
-        "pull_request" | "issues" => {
+        "pull_request" | "issues" | "issue_comment" => {
             // Detach: token minting + config fetch + model call off the ack path.
             let body = body.to_vec();
             tokio::spawn(async move {
@@ -78,8 +78,71 @@ async fn dispatch(state: &AppState, event: &str, delivery: &str, body: &[u8]) ->
     match event {
         "pull_request" => dispatch_pr(state, delivery, body).await,
         "issues" => dispatch_issue(state, delivery, body).await,
+        "issue_comment" => dispatch_command(state, delivery, body).await,
         _ => Ok(()),
     }
+}
+
+/// Build the per-PR review job from a fetched/received pull request.
+fn pr_job(
+    repo: &nogent_core::events::Repository,
+    pr: &nogent_core::events::PullRequest,
+    cfg: ResolvedConfig,
+    model: String,
+) -> Option<EventJob> {
+    let (owner, name) = repo.owner_repo()?;
+    Some(EventJob {
+        kind: JobKind::PrReview,
+        repo_full_name: repo.full_name.clone(),
+        owner: owner.to_string(),
+        repo: name.to_string(),
+        number: pr.number,
+        title: pr.title.clone(),
+        body: pr.body.clone().unwrap_or_default(),
+        author: pr.user.login.clone(),
+        html_url: pr.html_url.clone(),
+        default_branch: repo.default_branch.clone(),
+        base_ref: Some(pr.base.ref_name.clone()),
+        base_sha: Some(pr.base.sha.clone()),
+        head_ref: Some(pr.head.ref_name.clone()),
+        head_sha: Some(pr.head.sha.clone()),
+        config: cfg,
+        model,
+    })
+}
+
+/// `/nogent review` posted as a PR comment → re-review the PR's latest commit.
+async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
+    let ev: nogent_core::events::IssueCommentEvent = serde_json::from_slice(body)
+        .map_err(|e| nogent_core::NogentError::Payload(format!("issue_comment: {e}")))?;
+
+    // Only created/edited comments, only on PRs, only the exact command.
+    if !matches!(ev.action.as_str(), "created" | "edited")
+        || ev.issue.pull_request.is_none()
+        || !events::is_review_command(&ev.comment.body)
+    {
+        return Ok(());
+    }
+    let Some((owner, repo)) = ev.repository.owner_repo() else {
+        return Ok(());
+    };
+
+    let token = state.auth.installation_token(ev.installation.id).await?;
+    let cfg = resolve_config(&token, owner, repo).await?;
+    if !cfg.enabled || !cfg.pr_review_enabled {
+        return Ok(());
+    }
+
+    // Fetch the PR for fresh head/base SHAs (the comment payload lacks them).
+    let gh = crate::github_client::GithubClient::new(&token)?;
+    let pr = gh.get_pull_request(owner, repo, ev.issue.number).await?;
+    let Some(job) = pr_job(&ev.repository, &pr, cfg, state.cfg.gemini_model.clone()) else {
+        return Ok(());
+    };
+
+    review::run(&state.cfg, &token, &job).await?;
+    tracing::info!(%delivery, pr = ev.issue.number, "reviewed PR on /nogent review");
+    Ok(())
 }
 
 async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
@@ -102,28 +165,18 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
         return Ok(());
     }
 
-    let pr = &ev.pull_request;
-    let job = EventJob {
-        kind: JobKind::PrReview,
-        repo_full_name: ev.repository.full_name.clone(),
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        number: pr.number,
-        title: pr.title.clone(),
-        body: pr.body.clone().unwrap_or_default(),
-        author: pr.user.login.clone(),
-        html_url: pr.html_url.clone(),
-        default_branch: ev.repository.default_branch.clone(),
-        base_ref: Some(pr.base.ref_name.clone()),
-        base_sha: Some(pr.base.sha.clone()),
-        head_ref: Some(pr.head.ref_name.clone()),
-        head_sha: Some(pr.head.sha.clone()),
-        config: cfg,
-        model: state.cfg.gemini_model.clone(),
+    let number = ev.pull_request.number;
+    let Some(job) = pr_job(
+        &ev.repository,
+        &ev.pull_request,
+        cfg,
+        state.cfg.gemini_model.clone(),
+    ) else {
+        return Ok(());
     };
 
     review::run(&state.cfg, &token, &job).await?;
-    tracing::info!(%delivery, pr = pr.number, "reviewed PR");
+    tracing::info!(%delivery, pr = number, "reviewed PR");
     Ok(())
 }
 
