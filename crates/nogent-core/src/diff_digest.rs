@@ -134,38 +134,99 @@ pub fn commentable_lines(files: &[ChangedFile]) -> BTreeMap<String, BTreeSet<u64
     map
 }
 
-/// Full post-change content of a changed file, for review context.
-#[derive(Debug, Clone)]
-pub struct FileContent {
-    pub filename: String,
-    pub content: String,
+/// Identifiers referenced on ADDED diff lines (`+`), deduped in first-seen
+/// order — used to pre-resolve their definitions from the repo so the model
+/// doesn't have to navigate for them. Skips diff headers, short tokens, and
+/// Rust keywords. Capped.
+#[must_use]
+pub fn referenced_identifiers(files: &[ChangedFile]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for f in files {
+        let Some(patch) = &f.patch else { continue };
+        for line in patch.lines() {
+            let Some(rest) = line.strip_prefix('+') else {
+                continue;
+            };
+            if rest.starts_with("++") {
+                continue; // "+++ b/file" header
+            }
+            for tok in identifiers_in(rest) {
+                if tok.len() >= 3 && !is_rust_keyword(tok) && seen.insert(tok.to_string()) {
+                    out.push(tok.to_string());
+                    if out.len() >= 300 {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
-/// Build a bounded "current file contents" section so the model can review each
-/// change inside its whole file. Files are included in order until the shared
-/// byte budget is exhausted; the file that crosses the budget is truncated and
-/// any remaining files are noted as omitted.
-#[must_use]
-pub fn build_file_context(files: &[FileContent], max_context_bytes: usize) -> String {
-    let mut sections: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    let mut omitted = 0usize;
-    for f in files {
-        if used >= max_context_bytes {
-            omitted += 1;
-            continue;
+/// Split a line into identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`).
+fn identifiers_in(line: &str) -> Vec<&str> {
+    let mut toks = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'_' || c.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            toks.push(&line[start..i]);
+        } else {
+            i += 1;
         }
-        let remaining = max_context_bytes.saturating_sub(used);
-        let body = truncate_on_char_boundary(&f.content, remaining);
-        used = used.saturating_add(body.len());
-        sections.push(format!("===== {} =====\n{}", f.filename, body));
     }
-    if omitted > 0 {
-        sections.push(format!(
-            "[{omitted} more changed file(s) omitted to fit the context budget]"
-        ));
-    }
-    sections.join("\n\n")
+    toks
+}
+
+fn is_rust_keyword(t: &str) -> bool {
+    matches!(
+        t,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "union"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "let_else"
+    )
 }
 
 #[cfg(test)]
@@ -225,24 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn file_context_respects_budget_and_notes_omissions() {
-        let files = vec![
-            FileContent {
-                filename: "a.rs".into(),
-                content: "x".repeat(5_000),
-            },
-            FileContent {
-                filename: "b.rs".into(),
-                content: "y".repeat(5_000),
-            },
-        ];
-        let ctx = build_file_context(&files, 3_000);
-        assert!(ctx.contains("===== a.rs ====="));
-        // Second file doesn't fit → noted as omitted.
-        assert!(ctx.contains("omitted to fit the context budget"));
-    }
-
-    #[test]
     fn commentable_lines_tracks_new_side() {
         let patch = "@@ -1,3 +1,4 @@\n context1\n-old\n+new1\n+new2\n context2";
         let files = vec![ChangedFile {
@@ -262,20 +305,21 @@ mod tests {
     }
 
     #[test]
-    fn file_context_includes_all_when_within_budget() {
-        let files = vec![
-            FileContent {
-                filename: "a.rs".into(),
-                content: "small".into(),
-            },
-            FileContent {
-                filename: "b.rs".into(),
-                content: "also small".into(),
-            },
-        ];
-        let ctx = build_file_context(&files, 100_000);
-        assert!(ctx.contains("===== a.rs =====") && ctx.contains("===== b.rs ====="));
-        assert!(!ctx.contains("omitted"));
+    fn referenced_identifiers_from_added_lines() {
+        let patch = "@@ -1 +1,2 @@\n+    let r = add_numbers(5, 10);\n+    let x = Foo::new();\n-    old_thing();";
+        let files = vec![ChangedFile {
+            filename: "m.rs".into(),
+            status: "modified".into(),
+            additions: 2,
+            deletions: 1,
+            patch: Some(patch.into()),
+        }];
+        let ids = referenced_identifiers(&files);
+        assert!(ids.iter().any(|i| i == "add_numbers"));
+        assert!(ids.iter().any(|i| i == "Foo"));
+        // keywords filtered, removed-line idents excluded
+        assert!(!ids.iter().any(|i| i == "let"));
+        assert!(!ids.iter().any(|i| i == "old_thing"));
     }
 
     #[test]

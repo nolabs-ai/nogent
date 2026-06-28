@@ -1,7 +1,8 @@
 //! A bounded, in-memory snapshot of the repository at the PR head, built from
-//! the GitHub tarball. Backs the agentic review tools (`grep`, `read_file`,
-//! `list_files`) so the model can resolve symbols and inspect files the diff
-//! references — without cloning to disk or executing anything.
+//! the GitHub tarball. Backs the agentic review tools (`definition`, `grep`,
+//! `read_file`, `list_files`) and diff symbol pre-resolution, so the model can
+//! resolve symbols and inspect files the diff references — without cloning to
+//! disk or executing anything. Also builds a regex symbol table on construction.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -18,8 +19,18 @@ const READ_RETURN_CAP: usize = 60_000;
 const GREP_LINE_CAP: usize = 300;
 const LIST_CAP: usize = 800;
 
+/// A symbol definition: where it's defined and its signature line.
+#[derive(Debug, Clone)]
+pub struct Def {
+    pub file: String,
+    pub line: u64,
+    pub signature: String,
+}
+
 pub struct RepoIndex {
     files: BTreeMap<String, String>,
+    /// symbol name → its definition site(s), for precise lookups without grep.
+    symbols: BTreeMap<String, Vec<Def>>,
 }
 
 impl RepoIndex {
@@ -69,7 +80,7 @@ impl RepoIndex {
                 files.insert(rel, text);
             }
         }
-        Ok(Some(RepoIndex { files }))
+        Ok(Some(Self::from_files(files)))
     }
 
     /// Build from a local directory (for `--review-local` eval). Skips VCS/build
@@ -125,12 +136,71 @@ impl RepoIndex {
                 }
             }
         }
-        Ok(Some(RepoIndex { files }))
+        Ok(Some(Self::from_files(files)))
+    }
+
+    /// Assemble the index from a file map, building the symbol table once.
+    fn from_files(files: BTreeMap<String, String>) -> Self {
+        let symbols = build_symbols(&files);
+        RepoIndex { files, symbols }
     }
 
     #[must_use]
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    #[must_use]
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+
+    /// Definitions of `name`, each with a bounded source body — for the
+    /// `definition` tool (precise + small vs grep-across-repo + whole-file read).
+    #[must_use]
+    pub fn definition(&self, name: &str, max_defs: usize) -> Vec<(String, u64, String)> {
+        let Some(defs) = self.symbols.get(name) else {
+            return Vec::new();
+        };
+        defs.iter()
+            .take(max_defs)
+            .map(|d| {
+                let body = self
+                    .files
+                    .get(&d.file)
+                    .map(|c| extract_body(c, d.line))
+                    .unwrap_or_else(|| d.signature.clone());
+                (d.file.clone(), d.line, body)
+            })
+            .collect()
+    }
+
+    /// A compact, bounded "definitions referenced by the diff" block: for each
+    /// identifier with a known definition, its location + signature (no bodies —
+    /// the model can call `definition`/`read_file` for those). Empty if none.
+    #[must_use]
+    pub fn referenced_defs_context(
+        &self,
+        idents: &[String],
+        max_defs: usize,
+        max_bytes: usize,
+    ) -> String {
+        let mut lines = Vec::new();
+        let mut used = 0usize;
+        for ident in idents {
+            if lines.len() >= max_defs || used >= max_bytes {
+                break;
+            }
+            if let Some(defs) = self.symbols.get(ident) {
+                // At most one site per identifier in the pre-resolution hint.
+                if let Some(d) = defs.first() {
+                    let line = format!("- `{}` — {}:{}: `{}`", ident, d.file, d.line, d.signature);
+                    used += line.len();
+                    lines.push(line);
+                }
+            }
+        }
+        lines.join("\n")
     }
 
     /// Full content of a file (capped), or `None` if absent.
@@ -181,6 +251,83 @@ impl RepoIndex {
             .cloned()
             .collect()
     }
+}
+
+/// Scan `.rs` files for top-level Rust definitions (regex, not a full parser —
+/// good enough to locate a symbol's definition site + signature).
+fn build_symbols(files: &BTreeMap<String, String>) -> BTreeMap<String, Vec<Def>> {
+    // Compiled once per index build (once per review).
+    let fn_re = Regex::new(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:async\s+)?(?:const\s+)?(?:unsafe\s+)?(?:extern\s+\x22[^\x22]*\x22\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)",
+    );
+    let ty_re = Regex::new(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|union|type|const|static)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    );
+    let macro_re = Regex::new(r"^\s*macro_rules!\s+([A-Za-z_][A-Za-z0-9_]*)");
+    let (Ok(fn_re), Ok(ty_re), Ok(macro_re)) = (fn_re, ty_re, macro_re) else {
+        return BTreeMap::new();
+    };
+
+    let mut symbols: BTreeMap<String, Vec<Def>> = BTreeMap::new();
+    for (path, content) in files {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+        for (i, line) in content.lines().enumerate() {
+            let name = fn_re
+                .captures(line)
+                .or_else(|| ty_re.captures(line))
+                .or_else(|| macro_re.captures(line))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string());
+            if let Some(name) = name {
+                let sig: String = line.trim().chars().take(200).collect();
+                let entry = symbols.entry(name).or_default();
+                if entry.len() < 8 {
+                    entry.push(Def {
+                        file: path.clone(),
+                        line: (i + 1) as u64,
+                        signature: sig,
+                    });
+                }
+            }
+        }
+    }
+    symbols
+}
+
+/// Extract a bounded source body starting at `start_line` (1-based): from the
+/// definition line until braces balance (or a `;` for declarations), capped.
+fn extract_body(content: &str, start_line: u64) -> String {
+    const MAX_LINES: usize = 120;
+    const MAX_BYTES: usize = 6_000;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = (start_line.saturating_sub(1)) as usize;
+    let mut out = String::new();
+    let mut depth: i32 = 0;
+    let mut seen_brace = false;
+    for line in lines.iter().skip(start).take(MAX_LINES) {
+        out.push_str(line);
+        out.push('\n');
+        for c in line.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    seen_brace = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if (seen_brace && depth <= 0) || (!seen_brace && line.trim_end().ends_with(';')) {
+            break;
+        }
+        if out.len() >= MAX_BYTES {
+            out.push_str("[…truncated]\n");
+            break;
+        }
+    }
+    out
 }
 
 /// Largest char boundary <= `max` (so slicing never splits a codepoint).
@@ -262,6 +409,39 @@ mod tests {
         let gz = make_tarball(&[("a.txt", &big), ("b.txt", &big)]);
         // Cap below total → None (caller falls back to diff-only).
         assert!(RepoIndex::from_tarball(&gz, 25_000).expect("ok").is_none());
+    }
+
+    #[test]
+    fn symbol_index_resolves_definitions_and_context() {
+        let gz = make_tarball(&[
+            (
+                "src/math.rs",
+                "pub fn add_numbers(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub struct Calc;",
+            ),
+            ("src/main.rs", "let r = add_numbers(5, 10);"),
+        ]);
+        let idx = RepoIndex::from_tarball(&gz, 10_000_000)
+            .expect("ok")
+            .expect("some");
+        assert!(idx.symbol_count() >= 2); // add_numbers + Calc
+
+        let defs = idx.definition("add_numbers", 3);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].0, "src/math.rs");
+        assert!(defs[0].2.contains("a + b")); // body extracted, not just signature
+
+        let ctx = idx.referenced_defs_context(
+            &[
+                "add_numbers".to_string(),
+                "Calc".to_string(),
+                "missing".to_string(),
+            ],
+            10,
+            10_000,
+        );
+        assert!(ctx.contains("add_numbers") && ctx.contains("src/math.rs:1"));
+        assert!(ctx.contains("Calc"));
+        assert!(!ctx.contains("missing"));
     }
 
     #[test]

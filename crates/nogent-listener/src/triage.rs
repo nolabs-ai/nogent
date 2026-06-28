@@ -54,6 +54,7 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         tokens_in = u.input_tokens,
         tokens_out = u.output_tokens,
         thinking_tokens = u.thinking_tokens,
+        cached_tokens = u.cached_tokens,
         "posted issue triage"
     );
     Ok(())

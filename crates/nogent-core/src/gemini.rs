@@ -243,6 +243,9 @@ pub struct UsageMetadata {
     pub candidates_token_count: u64,
     #[serde(rename = "thoughtsTokenCount", default)]
     pub thoughts_token_count: u64,
+    /// Portion of the prompt served from cache (billed at the cheaper rate).
+    #[serde(rename = "cachedContentTokenCount", default)]
+    pub cached_content_token_count: u64,
     #[serde(rename = "totalTokenCount", default)]
     pub total_token_count: u64,
 }

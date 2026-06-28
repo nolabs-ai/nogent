@@ -63,14 +63,17 @@ and perf — plus sandbox-specific security: path footguns (`String` vs
 capabilities, silent security fallbacks, FFI/ABI breaks, Landlock-vs-Seatbelt
 divergence, missing `EnvVarGuard` in tests, missing `// SAFETY:`, and DCO.
 
-For each changed file the model receives the diff **and** the full post-change
-file content (bounded by `maxContextBytes`). Beyond that, it can **navigate the
-rest of the repo at the PR head** via tools — `grep`, `read_file`, `list_files`
-— in a bounded agentic loop (Gemini function-calling), so when the diff calls a
-function defined elsewhere it can look up that definition before judging the
-change. The repo is fetched once as a tarball into a bounded in-memory index
-(skips binaries/large files; over the cap it falls back to diff-only). Tool
-results are treated as untrusted content under the same injection rules.
+For token economy the model receives the **diff** plus **pre-resolved
+definitions** of the symbols the diff references — not full file content (which
+re-sending across the agentic turns was the dominant cost). It then **navigates
+the repo at the PR head on demand** via tools — `definition` (symbol → its
+source), `grep`, `read_file`, `list_files` — in a bounded loop (Gemini
+function-calling), followed by a **self-critique pass** for anything missed. The
+repo is fetched once as a tarball into a bounded in-memory index (with a regex
+symbol table; skips binaries/large files; over the cap it falls back to
+diff-only). Tool results and pre-resolved defs are treated as untrusted content
+under the same injection rules. Per-session token usage (incl. cached tokens) is
+logged for cost tracking.
 
 ## Customizing the review
 

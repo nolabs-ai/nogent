@@ -16,6 +16,7 @@ pub struct UsageSnapshot {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub thinking_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 #[derive(Default)]
@@ -24,6 +25,7 @@ struct Usage {
     input: AtomicU64,
     output: AtomicU64,
     thinking: AtomicU64,
+    cached: AtomicU64,
 }
 
 pub struct GeminiClient {
@@ -55,6 +57,7 @@ impl GeminiClient {
             input_tokens: self.usage.input.load(Ordering::Relaxed),
             output_tokens: self.usage.output.load(Ordering::Relaxed),
             thinking_tokens: self.usage.thinking.load(Ordering::Relaxed),
+            cached_tokens: self.usage.cached.load(Ordering::Relaxed),
         }
     }
 
@@ -87,6 +90,9 @@ impl GeminiClient {
             self.usage
                 .thinking
                 .fetch_add(u.thoughts_token_count, Ordering::Relaxed);
+            self.usage
+                .cached
+                .fetch_add(u.cached_content_token_count, Ordering::Relaxed);
         }
         Ok(parsed)
     }

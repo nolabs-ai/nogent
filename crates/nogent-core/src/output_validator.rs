@@ -113,6 +113,148 @@ pub fn finding_inline_body(f: &Finding) -> String {
     }
 }
 
+/// Best-effort recovery of findings from a possibly-truncated review (the JSON
+/// got cut off mid-array, so strict parse failed). Requires the canary to be
+/// present and match; recovers every complete finding object before the cut.
+/// Returns `None` if the canary is absent/wrong (the injection gate still holds).
+#[must_use]
+pub fn salvage_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOutput> {
+    let t = extract_object(raw);
+    let canary = json_string_field(t, "canary")?;
+    if !canary_matches(&canary, expected_canary) {
+        return None;
+    }
+    let summary = json_string_field(t, "summary").unwrap_or_default();
+    let findings = dedup_findings(scan_findings(t))
+        .into_iter()
+        .filter(|f| f.description.chars().count() <= MAX_FINDING_DESC)
+        .take(MAX_ITEMS)
+        .collect();
+    Some(PrReviewOutput {
+        canary,
+        findings,
+        summary,
+    })
+}
+
+/// Drop duplicate findings (same file+line+category and a matching description
+/// prefix), preserving first-seen order. Used when merging review passes.
+#[must_use]
+pub fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for f in findings {
+        let desc_prefix: String = f
+            .description
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .to_lowercase();
+        let key = (
+            f.file.to_lowercase(),
+            f.line,
+            f.category.trim_matches(['[', ']']).to_lowercase(),
+            desc_prefix,
+        );
+        if seen.insert(key) {
+            out.push(f);
+        }
+    }
+    out.truncate(MAX_ITEMS);
+    out
+}
+
+/// Read a top-level JSON string field by key, tolerant of truncation elsewhere.
+fn json_string_field(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let start = s.find(&pat)? + pat.len();
+    let after = s[start..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let inner = after.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut esc = false;
+    for c in inner.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None // unterminated → not a usable value
+}
+
+/// Scan the `findings` array and parse every COMPLETE `{...}` object, stopping
+/// at the first incomplete one (truncation). String- and escape-aware.
+fn scan_findings(s: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let Some(fi) = s.find("\"findings\"") else {
+        return out;
+    };
+    let chars: Vec<char> = s[fi..].chars().collect();
+    let Some(mut i) = chars.iter().position(|&c| c == '[') else {
+        return out;
+    };
+    i += 1;
+    while i < chars.len() {
+        while i < chars.len() && chars[i] != '{' {
+            if chars[i] == ']' {
+                return out; // end of array
+            }
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut end = None;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        match end {
+            Some(e) => {
+                let obj: String = chars[start..=e].iter().collect();
+                if let Ok(f) = serde_json::from_str::<Finding>(&obj) {
+                    out.push(f);
+                }
+                i = e + 1;
+            }
+            None => break, // truncated object → stop
+        }
+    }
+    out
+}
+
 /// Render a validated PR review as a single flat Markdown body (used by local
 /// eval, which prints to stdout rather than posting inline comments).
 #[must_use]
@@ -337,6 +479,47 @@ mod tests {
         let c = "c";
         let fenced = format!("```json\n{}\n```", pr_json(c));
         assert!(validate_pr_review(&fenced, c).is_some());
+    }
+
+    #[test]
+    fn salvages_findings_from_truncated_json() {
+        // Third finding object is cut off mid-way (truncation).
+        let raw = r#"{"canary":"c","summary":"s","findings":[
+            {"category":"bug","file":"a.rs","line":1,"description":"d1"},
+            {"category":"perf","file":"b.rs","line":2,"description":"d2"},
+            {"category":"nit","file":"c.rs","line":"#;
+        // Strict validation fails…
+        assert!(validate_pr_review(raw, "c").is_none());
+        // …but salvage recovers the two complete findings + canary + summary.
+        let out = salvage_pr_review(raw, "c").expect("salvage");
+        assert_eq!(out.canary, "c");
+        assert_eq!(out.summary, "s");
+        assert_eq!(out.findings.len(), 2);
+        assert_eq!(out.findings[1].file, "b.rs");
+    }
+
+    #[test]
+    fn salvage_rejects_wrong_canary() {
+        let raw = r#"{"canary":"wrong","findings":[{"description":"x"}"#;
+        assert!(salvage_pr_review(raw, "c").is_none());
+    }
+
+    #[test]
+    fn dedup_removes_repeats_keeps_first() {
+        let f = |file: &str, desc: &str| Finding {
+            category: "bug".into(),
+            file: file.into(),
+            line: Some(1),
+            description: desc.into(),
+        };
+        let deduped = dedup_findings(vec![
+            f("a.rs", "same issue"),
+            f("a.rs", "same issue"),
+            f("b.rs", "other"),
+        ]);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].file, "a.rs");
+        assert_eq!(deduped[1].file, "b.rs");
     }
 
     #[test]

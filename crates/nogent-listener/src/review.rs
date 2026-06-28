@@ -1,18 +1,19 @@
 //! PR review orchestration (general code review + sandbox security), run
-//! in-process. The model gets the diff and the full changed files up front, and
-//! can navigate the rest of the repo at the PR head via tools (grep, read_file,
-//! list_files) in a bounded agentic loop — so it can resolve symbols the diff
-//! references (e.g. find the definition of a called function).
+//! in-process. To keep token cost down we send the diff + pre-resolved
+//! definitions of symbols it references (NOT full file content), and let the
+//! model pull what it needs on demand via tools (`definition`, `grep`,
+//! `read_file`, `list_files`) in a bounded agentic loop, then a self-critique
+//! pass for anything missed.
 
 use nogent_core::diff_digest::{
-    DiffDigest, FileContent, build_digest, build_file_context, commentable_lines,
+    DiffDigest, build_digest, commentable_lines, referenced_identifiers,
 };
 use nogent_core::error::Result;
 use nogent_core::events::{EventJob, JobKind};
 use nogent_core::gemini::{Content, FunctionCall, FunctionDeclaration, Part, Tool};
 use nogent_core::output_validator::{
-    FALLBACK_MESSAGE, finding_inline_body, format_pr_review_body, format_pr_review_markdown,
-    generate_canary, validate_pr_review,
+    FALLBACK_MESSAGE, PrReviewOutput, dedup_findings, finding_inline_body, format_pr_review_body,
+    format_pr_review_markdown, generate_canary, salvage_pr_review, validate_pr_review,
 };
 use nogent_core::prompts::pr_review;
 use nogent_core::repo_config::ResolvedConfig;
@@ -37,31 +38,9 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
     let files = gh.list_pr_files(&job.owner, &job.repo, job.number).await?;
     let digest = build_digest(&files, job.config.max_files, job.config.max_patch_bytes);
 
-    // Full content of the changed files, as the model's starting context.
     let head = job.head_sha.as_deref().unwrap_or_default();
-    let selected = &files[..files.len().min(job.config.max_files)];
-    let mut contents_for_ctx: Vec<FileContent> = Vec::new();
-    if !head.is_empty() {
-        for f in selected {
-            if f.status == "removed" || f.patch.is_none() {
-                continue;
-            }
-            if let Some(c) = gh
-                .get_file_raw(&job.owner, &job.repo, &f.filename, head)
-                .await?
-            {
-                contents_for_ctx.push(FileContent {
-                    filename: f.filename.clone(),
-                    content: c,
-                });
-            }
-        }
-    }
-    let file_context = build_file_context(&contents_for_ctx, job.config.max_context_bytes);
-    let user = pr_review::user_prompt(job, &digest, &file_context);
 
-    // Repo snapshot at the PR head for navigation tools (bounded; None → the
-    // model reviews from diff + changed files only).
+    // Repo snapshot at the PR head for navigation tools + symbol resolution.
     let index = if head.is_empty() {
         None
     } else {
@@ -73,6 +52,19 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
             None => None,
         }
     };
+
+    // Pre-resolve definitions of symbols the diff references so the model rarely
+    // needs to navigate. We deliberately do NOT pre-send full file content — that
+    // is the dominant resent-token cost; the model reads files on demand via the
+    // tools instead.
+    let context = match index.as_ref() {
+        Some(idx) => {
+            let idents = referenced_identifiers(&files);
+            idx.referenced_defs_context(&idents, 40, job.config.max_context_bytes)
+        }
+        None => String::new(),
+    };
+    let user = pr_review::user_prompt(job, &digest, &context);
 
     // Maintainer guidance from NOGENT.md on the BASE ref (trusted — a fork PR
     // cannot change the base, so this can safely steer the system prompt).
@@ -92,17 +84,10 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         cfg.gemini_thinking_level.as_deref(),
     )?;
 
-    let raw = match index.as_ref() {
-        Some(idx) => run_agentic(&gemini, &system, &user, idx).await?,
-        None => {
-            let parts = gemini
-                .generate_turn(&system, &[Content::user_text(user)], &[])
-                .await?;
-            concat_text(&parts)
-        }
-    };
+    let mut session = AgentSession::new(&gemini, &system, index.as_ref(), user);
+    let review = run_review(&mut session, &canary).await?;
 
-    match validate_pr_review(&raw, &canary) {
+    match review {
         Some(out) => {
             // Anchor findings with a valid changed-line as inline comments; the
             // rest (no line, or a line outside the diff) go in the body so the
@@ -133,14 +118,14 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
                 files = digest.files_included,
                 inline = inline_count,
                 indexed_files = index.as_ref().map(RepoIndex::file_count).unwrap_or(0),
+                indexed_symbols = index.as_ref().map(RepoIndex::symbol_count).unwrap_or(0),
                 "posted PR review"
             );
         }
         None => {
             tracing::warn!(
                 pr = job.number,
-                raw = %raw.chars().take(6000).collect::<String>(),
-                "model output failed validation; posting fallback"
+                "model output failed validation after salvage + retry; posting fallback"
             );
             gh.post_pr_review(&job.owner, &job.repo, job.number, FALLBACK_MESSAGE)
                 .await?;
@@ -153,63 +138,165 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         tokens_in = u.input_tokens,
         tokens_out = u.output_tokens,
         thinking_tokens = u.thinking_tokens,
+        cached_tokens = u.cached_tokens,
         "gemini token usage"
     );
     Ok(())
 }
 
-/// Drive the tool-calling loop until the model emits a final (text) answer, the
-/// turn cap is hit, or the tool-output budget is exhausted (after which tools
-/// are withdrawn so the model must conclude).
-async fn run_agentic(
-    gemini: &GeminiClient,
-    system: &str,
-    user: &str,
-    index: &RepoIndex,
-) -> Result<String> {
-    let tools = repo_tools();
-    let mut contents = vec![Content::user_text(user.to_string())];
-    let mut tool_bytes = 0usize;
+/// A stateful review conversation. Holds the running `contents` so we can drive
+/// several "ask → converge" rounds (initial review, then self-critique) over one
+/// context without re-sending the diff. `index = None` → no tools (diff-only).
+struct AgentSession<'a> {
+    gemini: &'a GeminiClient,
+    system: &'a str,
+    index: Option<&'a RepoIndex>,
+    tools: Vec<Tool>,
+    contents: Vec<Content>,
+    tool_bytes: usize,
+}
 
-    for _ in 0..MAX_TURNS {
-        let active: Vec<Tool> = if tool_bytes > MAX_TOOL_OUTPUT_BYTES {
-            Vec::new() // budget spent → force a conclusion
+impl<'a> AgentSession<'a> {
+    fn new(
+        gemini: &'a GeminiClient,
+        system: &'a str,
+        index: Option<&'a RepoIndex>,
+        first_user: String,
+    ) -> Self {
+        let tools = if index.is_some() {
+            repo_tools()
         } else {
-            tools.clone()
+            Vec::new()
         };
-        let parts = gemini.generate_turn(system, &contents, &active).await?;
-        let calls: Vec<FunctionCall> = parts
-            .iter()
-            .filter_map(|p| p.function_call.clone())
-            .collect();
-        if calls.is_empty() {
-            return Ok(concat_text(&parts)); // final answer
+        AgentSession {
+            gemini,
+            system,
+            index,
+            tools,
+            contents: vec![Content::user_text(first_user)],
+            tool_bytes: 0,
         }
-
-        // Echo the model's tool-call turn, then answer each call.
-        contents.push(Content::model(parts.clone()));
-        let mut responses = Vec::with_capacity(calls.len());
-        for call in &calls {
-            tracing::info!(tool = %call.name, args = %call.args, "review tool call");
-            let result = dispatch_tool(index, call);
-            tool_bytes = tool_bytes
-                .saturating_add(serde_json::to_string(&result).map(|s| s.len()).unwrap_or(0));
-            // Echo the call id (Gemini 3.x requires id+name match, one per call).
-            responses.push(Part::function_response(
-                call.id.as_deref(),
-                &call.name,
-                result,
-            ));
-        }
-        contents.push(Content::tool_results(responses));
     }
 
-    // Turn cap reached without a final answer: force one, no tools.
-    contents.push(Content::user_text(
-        "Stop investigating and output your final JSON review now.".to_string(),
+    /// Append a user turn (e.g. the self-critique instruction).
+    fn say(&mut self, text: String) {
+        self.contents.push(Content::user_text(text));
+    }
+
+    /// Run the tool loop until the model emits a final (text) answer, the turn
+    /// cap is hit, or the shared tool-output budget is spent. The answer is
+    /// retained in history so a follow-up round can build on it.
+    async fn answer(&mut self) -> Result<String> {
+        for _ in 0..MAX_TURNS {
+            let active: Vec<Tool> = if self.tool_bytes > MAX_TOOL_OUTPUT_BYTES {
+                Vec::new()
+            } else {
+                self.tools.clone()
+            };
+            let parts = self
+                .gemini
+                .generate_turn(self.system, &self.contents, &active)
+                .await?;
+            let calls: Vec<FunctionCall> = parts
+                .iter()
+                .filter_map(|p| p.function_call.clone())
+                .collect();
+            if calls.is_empty() {
+                let text = concat_text(&parts);
+                self.contents.push(Content::model(parts));
+                return Ok(text);
+            }
+            self.contents.push(Content::model(parts.clone()));
+            let mut responses = Vec::with_capacity(calls.len());
+            for call in &calls {
+                tracing::info!(tool = %call.name, args = %call.args, "review tool call");
+                let result = self
+                    .index
+                    .map(|idx| dispatch_tool(idx, call))
+                    .unwrap_or_else(|| json!({"error": "no repository index available"}));
+                self.tool_bytes = self
+                    .tool_bytes
+                    .saturating_add(serde_json::to_string(&result).map(|s| s.len()).unwrap_or(0));
+                responses.push(Part::function_response(
+                    call.id.as_deref(),
+                    &call.name,
+                    result,
+                ));
+            }
+            self.contents.push(Content::tool_results(responses));
+        }
+        self.say("Stop investigating and output your final JSON review now.".to_string());
+        let parts = self
+            .gemini
+            .generate_turn(self.system, &self.contents, &[])
+            .await?;
+        let text = concat_text(&parts);
+        self.contents.push(Content::model(parts));
+        Ok(text)
+    }
+}
+
+/// Produce the merged review: initial pass + a self-critique pass for anything
+/// missed, deduped. `None` only if the first pass couldn't yield valid output
+/// (even after salvage + one retry).
+async fn run_review(
+    session: &mut AgentSession<'_>,
+    canary: &str,
+) -> Result<Option<PrReviewOutput>> {
+    let raw1 = session.answer().await?;
+    let Some(mut out) = finalize(session, &raw1, canary).await? else {
+        return Ok(None);
+    };
+
+    // Self-critique: one focused pass for issues the first pass didn't report.
+    session.say(critique_prompt(canary));
+    let raw2 = session.answer().await?;
+    if let Some(extra) =
+        validate_pr_review(&raw2, canary).or_else(|| salvage_pr_review(&raw2, canary))
+    {
+        let before = out.findings.len();
+        let mut all = std::mem::take(&mut out.findings);
+        all.extend(extra.findings);
+        out.findings = dedup_findings(all);
+        tracing::info!(
+            added = out.findings.len().saturating_sub(before),
+            "self-critique pass"
+        );
+    }
+    Ok(Some(out))
+}
+
+/// Validate the first answer; on failure try salvage, then one re-ask for a
+/// complete object. Prevents a truncated/invalid response from yielding nothing.
+async fn finalize(
+    session: &mut AgentSession<'_>,
+    raw: &str,
+    canary: &str,
+) -> Result<Option<PrReviewOutput>> {
+    if let Some(out) = validate_pr_review(raw, canary) {
+        return Ok(Some(out));
+    }
+    if let Some(out) = salvage_pr_review(raw, canary) {
+        tracing::warn!("recovered review from truncated/invalid output");
+        return Ok(Some(out));
+    }
+    session.say(format!(
+        "Your previous response was not a single valid JSON object (it may have been \
+truncated). Re-send the COMPLETE JSON object only — including the canary \"{canary}\" — \
+and keep finding descriptions concise."
     ));
-    let parts = gemini.generate_turn(system, &contents, &[]).await?;
-    Ok(concat_text(&parts))
+    let raw2 = session.answer().await?;
+    Ok(validate_pr_review(&raw2, canary).or_else(|| salvage_pr_review(&raw2, canary)))
+}
+
+fn critique_prompt(canary: &str) -> String {
+    format!(
+        "Now do ONE focused second pass. Re-examine the diff — and use the tools if it helps — \
+for issues you did NOT already report: other changed files or lines, and categories you left \
+empty (security, correctness, error handling, tests, performance). Output the SAME JSON object \
+containing ONLY the additional findings (do not repeat earlier ones); use an empty findings \
+array if there are none. Include the canary \"{canary}\"."
+    )
 }
 
 /// Local eval entrypoint: review a diff against a locally-built repo index using
@@ -236,19 +323,17 @@ pub async fn run_local(
     let job = eval_job(model);
     let user = pr_review::user_prompt(&job, &digest, "");
     let gemini = GeminiClient::new(api_key, model, thinking_level)?;
-    let raw = run_agentic(&gemini, &system, &user, index).await?;
+    let mut session = AgentSession::new(&gemini, &system, Some(index), user);
+    let review = run_review(&mut session, &canary).await?;
     let u = gemini.usage();
     eprintln!(
-        "tokens: in={} out={} thinking={} (calls={})",
-        u.input_tokens, u.output_tokens, u.thinking_tokens, u.calls
+        "tokens: in={} (cached={}) out={} thinking={} (calls={})",
+        u.input_tokens, u.cached_tokens, u.output_tokens, u.thinking_tokens, u.calls
     );
-    Ok(match validate_pr_review(&raw, &canary) {
+    Ok(match review {
         Some(out) => format_pr_review_markdown(&out),
         None => {
-            tracing::warn!(
-                raw = %raw.chars().take(6000).collect::<String>(),
-                "model output failed validation"
-            );
+            tracing::warn!("model output failed validation after salvage + retry");
             FALLBACK_MESSAGE.to_string()
         }
     })
@@ -302,6 +387,19 @@ Use it to locate definitions (e.g. \"fn add_numbers\"), call sites, or symbols t
                 }),
             },
             FunctionDeclaration {
+                name: "definition".to_string(),
+                description:
+                    "Resolve a symbol (function, type, trait, const, macro) by name to its \
+definition site(s) and source body. Prefer this over grep+read_file when you need what a \
+referenced symbol does — it's precise and returns just that definition."
+                        .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }),
+            },
+            FunctionDeclaration {
                 name: "read_file".to_string(),
                 description: "Return the full text of a repository file at the PR head, by path."
                     .to_string(),
@@ -347,6 +445,19 @@ fn dispatch_tool(index: &RepoIndex, call: &FunctionCall) -> Value {
                         .collect::<Vec<_>>()
                 }),
                 Err(e) => json!({"error": e}),
+            }
+        }
+        "definition" => {
+            let name = call.args.get("name").and_then(Value::as_str).unwrap_or("");
+            let defs = index.definition(name, 3);
+            if defs.is_empty() {
+                json!({"error": "no definition found", "name": name})
+            } else {
+                json!({
+                    "definitions": defs.into_iter()
+                        .map(|(file, line, body)| json!({"file": file, "line": line, "body": body}))
+                        .collect::<Vec<_>>()
+                })
             }
         }
         "read_file" => {
