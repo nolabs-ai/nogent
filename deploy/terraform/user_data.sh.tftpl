@@ -17,7 +17,10 @@ chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
 
 # 2. Secrets → files. Private key as a 0600 file (multi-line PEM); webhook
 #    secret + Gemini key into the env file.
-install -d -m 0750 /etc/nogent
+# 0755 so the non-root container user (uid 65532) can traverse the dir to
+# read the bind-mounted PEM. Files inside stay restrictive (PEM 0640 uid 65532,
+# env file 0600 root).
+install -d -m 0755 /etc/nogent
 SECRET_JSON="$(aws secretsmanager get-secret-value \
   --region ${region} --secret-id ${secret_arn} \
   --query SecretString --output text)"
@@ -36,7 +39,13 @@ GEMINI_MODEL=${gemini_model}
 GEMINI_THINKING_LEVEL=${gemini_thinking_level}
 RUST_LOG=info
 EOF
-chmod 0600 /etc/nogent/app-private-key.pem /etc/nogent/nogent.env
+# The container runs as uid 65532 (Chainguard distroless `nonroot`) and reads
+# the PEM via a read-only bind mount, so it needs to be readable by that uid.
+# The env file is read by the docker daemon (host root) and injected, so it
+# stays 0600.
+chown 65532:65532 /etc/nogent/app-private-key.pem
+chmod 0640 /etc/nogent/app-private-key.pem
+chmod 0600 /etc/nogent/nogent.env
 
 # 3. Optional private-registry login.
 if [ -n "${image_registry_auth}" ]; then
