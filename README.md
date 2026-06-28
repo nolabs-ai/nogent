@@ -69,7 +69,9 @@ definitions** of the symbols the diff references — not full file content (whic
 re-sending across the agentic turns was the dominant cost). It then **navigates
 the repo at the PR head on demand** via tools — `definition` (symbol → its
 source), `grep`, `read_file`, `list_files` — in a bounded loop (Gemini
-function-calling), followed by a **self-critique pass** for anything missed. The
+function-calling), followed by **focused critique lenses** (coverage/parity,
+sinks, bypass) run every review to reduce variance and catch what one pass
+misses. The
 repo is fetched once as a tarball into a bounded in-memory index (with a regex
 symbol table; skips binaries/large files; over the cap it falls back to
 diff-only). Tool results and pre-resolved defs are treated as untrusted content

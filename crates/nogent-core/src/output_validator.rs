@@ -98,6 +98,17 @@ pub fn validate_pr_review(raw: &str, expected_canary: &str) -> Option<PrReviewOu
 
 const REVIEW_FOOTER: &str = "<sub>Automated code + security review. CI already covers clippy, rustfmt, tests, cargo-audit and commit-lint.</sub>";
 
+/// Collapse newlines/tabs/control chars to spaces so a finding renders as one
+/// clean bullet/comment (a model may embed a literal CRLF, e.g. demonstrating an
+/// injection, which would otherwise break the Markdown line).
+fn one_line(s: &str) -> String {
+    let collapsed: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    collapsed.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// `[sev · cat]` badge, e.g. `**[HIGH · security]**`. Either part may be absent.
 fn finding_badge(f: &Finding) -> String {
     let sev = f.severity.trim().to_uppercase();
@@ -121,7 +132,7 @@ pub fn finding_list_item(f: &Finding) -> String {
             None => s.push_str(&format!("`{}` — ", f.file)),
         }
     }
-    s.push_str(&f.description);
+    s.push_str(&one_line(&f.description));
     s
 }
 
@@ -129,7 +140,7 @@ pub fn finding_list_item(f: &Finding) -> String {
 /// anchor the comment, so they're omitted from the text).
 #[must_use]
 pub fn finding_inline_body(f: &Finding) -> String {
-    format!("{}{}", finding_badge(f), f.description)
+    format!("{}{}", finding_badge(f), one_line(&f.description))
 }
 
 /// Best-effort recovery of findings from a possibly-truncated review (the JSON
@@ -535,6 +546,22 @@ mod tests {
     fn salvage_rejects_wrong_canary() {
         let raw = r#"{"canary":"wrong","findings":[{"description":"x"}"#;
         assert!(salvage_pr_review(raw, "c").is_none());
+    }
+
+    #[test]
+    fn finding_render_collapses_embedded_newlines() {
+        let f = Finding {
+            severity: "high".into(),
+            category: "security".into(),
+            file: "a.rs".into(),
+            line: Some(9),
+            description: "reject CRLF (\r\n) in\theaders".into(),
+        };
+        let item = finding_list_item(&f);
+        assert!(!item.contains('\n') && !item.contains('\r') && !item.contains('\t'));
+        assert!(item.contains("**[HIGH · security]**"));
+        assert!(item.contains("`a.rs:9`"));
+        assert!(finding_inline_body(&f).lines().count() == 1);
     }
 
     #[test]

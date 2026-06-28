@@ -2,8 +2,8 @@
 //! in-process. To keep token cost down we send the diff + pre-resolved
 //! definitions of symbols it references (NOT full file content), and let the
 //! model pull what it needs on demand via tools (`definition`, `grep`,
-//! `read_file`, `list_files`) in a bounded agentic loop, then a self-critique
-//! pass for anything missed.
+//! `read_file`, `list_files`) in a bounded agentic loop, then a fixed sequence
+//! of focused critique lenses (coverage/parity, sinks, bypass) to cut variance.
 
 use nogent_core::diff_digest::{
     DiffDigest, build_digest, commentable_lines, referenced_identifiers,
@@ -26,7 +26,33 @@ use crate::repo_index::RepoIndex;
 
 /// Agentic loop bounds.
 const MAX_TURNS: usize = 12;
+/// Per critique-lens turn cap — each lens is focused, so it converges fast.
+const CRITIQUE_MAX_TURNS: usize = 5;
 const MAX_TOOL_OUTPUT_BYTES: usize = 600_000;
+
+/// Focused second-pass lenses, run in sequence over the same conversation to
+/// reduce run-to-run variance (each forces one high-impact angle every time).
+const CRITIQUE_LENSES: &[(&str, &str)] = &[
+    (
+        "coverage",
+        "COVERAGE & PARITY: for every control, validation, or handling this change adds, find its \
+siblings — other code paths (parallel protocols/transports, other entry points), other variants, \
+and other inputs/fields of the same kind — and confirm each gets the same treatment. A path or a \
+new field that skips the validation or enforcement its peers have is a finding. Use grep/definition \
+to locate the siblings.",
+    ),
+    (
+        "sinks",
+        "SINKS: trace every externally-influenced value this change introduces or touches to where \
+it is used (a request, header, query, command, path, or config) and confirm it is validated or \
+escaped for that destination before use.",
+    ),
+    (
+        "bypass",
+        "BYPASS: enumerate how any resource this change protects could still be reached WITHOUT the \
+new control — other entry points, transports, fallbacks, or default-open paths — and check each.",
+    ),
+];
 /// Repo snapshot bounds.
 const MAX_TARBALL_BYTES: usize = 80_000_000;
 const MAX_INDEX_BYTES: usize = 50_000_000;
@@ -186,8 +212,8 @@ impl<'a> AgentSession<'a> {
     /// Run the tool loop until the model emits a final (text) answer, the turn
     /// cap is hit, or the shared tool-output budget is spent. The answer is
     /// retained in history so a follow-up round can build on it.
-    async fn answer(&mut self) -> Result<String> {
-        for _ in 0..MAX_TURNS {
+    async fn answer(&mut self, max_turns: usize) -> Result<String> {
+        for _ in 0..max_turns {
             let active: Vec<Tool> = if self.tool_bytes > MAX_TOOL_OUTPUT_BYTES {
                 Vec::new()
             } else {
@@ -243,26 +269,26 @@ async fn run_review(
     session: &mut AgentSession<'_>,
     canary: &str,
 ) -> Result<Option<PrReviewOutput>> {
-    let raw1 = session.answer().await?;
+    let raw1 = session.answer(MAX_TURNS).await?;
     let Some(mut out) = finalize(session, &raw1, canary).await? else {
         return Ok(None);
     };
 
-    // Self-critique: one focused pass for issues the first pass didn't report.
-    session.say(critique_prompt(canary));
-    let raw2 = session.answer().await?;
-    if let Some(extra) =
-        validate_pr_review(&raw2, canary).or_else(|| salvage_pr_review(&raw2, canary))
-    {
-        let before = out.findings.len();
-        let mut all = std::mem::take(&mut out.findings);
-        all.extend(extra.findings);
-        out.findings = dedup_findings(all);
-        tracing::info!(
-            added = out.findings.len().saturating_sub(before),
-            "self-critique pass"
-        );
+    // Deterministic self-critique: run each focused lens in sequence so every
+    // high-impact angle is checked on every review (cuts run-to-run variance).
+    // The big context stays cached across these passes.
+    let mut all = std::mem::take(&mut out.findings);
+    for (label, instruction) in CRITIQUE_LENSES {
+        session.say(lens_prompt(instruction, canary));
+        let raw = session.answer(CRITIQUE_MAX_TURNS).await?;
+        if let Some(extra) =
+            validate_pr_review(&raw, canary).or_else(|| salvage_pr_review(&raw, canary))
+        {
+            tracing::info!(lens = label, added = extra.findings.len(), "critique lens");
+            all.extend(extra.findings);
+        }
     }
+    out.findings = dedup_findings(all); // dedup across all passes + severity-sort
     Ok(Some(out))
 }
 
@@ -285,23 +311,17 @@ async fn finalize(
 truncated). Re-send the COMPLETE JSON object only — including the canary \"{canary}\" — \
 and keep finding descriptions concise."
     ));
-    let raw2 = session.answer().await?;
+    let raw2 = session.answer(3).await?;
     Ok(validate_pr_review(&raw2, canary).or_else(|| salvage_pr_review(&raw2, canary)))
 }
 
-fn critique_prompt(canary: &str) -> String {
+/// Wrap a focused lens instruction with the shared output contract.
+fn lens_prompt(instruction: &str, canary: &str) -> String {
     format!(
-        "Now do ONE focused, adversarial second pass for HIGH-IMPACT issues you may have missed — \
-the kind that are absent rather than wrong-on-a-line. Use the tools (`grep`, `definition`, \
-`read_file`) to verify:\n\
-1. COVERAGE: for every control / validation / handling this change adds, find the sibling paths \
-(other transports like HTTP/2 or gRPC, other entry points, other config variants) and confirm \
-each enforces it. A path that skips it is a finding.\n\
-2. SINKS: trace any value that reaches a request, header, command, path, or profile and confirm \
-it is validated/escaped (CRLF, canonicalization, …).\n\
-3. BYPASS: enumerate how the protected resource could be reached WITHOUT the new control.\n\
-Output the SAME JSON object containing ONLY additional findings (do not repeat earlier ones); \
-use an empty findings array if there are none. Include the canary \"{canary}\"."
+        "Now a focused, adversarial pass for HIGH-IMPACT issues you may have missed — the kind \
+that are absent rather than wrong-on-a-line. {instruction}\n\
+Output the SAME JSON object containing ONLY additional findings (do not repeat ones you already \
+raised); use an empty findings array if there are none. Include the canary \"{canary}\"."
     )
 }
 
