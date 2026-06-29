@@ -20,16 +20,21 @@ dnf install -y docker jq chrony
 systemctl enable --now chronyd
 systemctl enable --now docker
 
-# compose v2 plugin — pinned version, checksum-verified against the release's
-# checksums.txt (no `releases/latest`, no unverified curl|install as root).
+# compose v2 plugin — pinned version, checksum-verified against the per-asset
+# `.sha256` sidecar published in the same release (more robust than parsing a
+# multi-asset `checksums.txt`: the sidecar contains exactly one line for the
+# file we just downloaded, so `sha256sum -c` either verifies it or fails loudly).
 ARCH="$(uname -m)"
-curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-$${ARCH}" -o /tmp/docker-compose
-curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/checksums.txt" -o /tmp/compose-checksums.txt
-COMPOSE_SHA="$(grep " docker-compose-linux-$${ARCH}\$" /tmp/compose-checksums.txt | awk '{print $1}')"
-echo "$${COMPOSE_SHA}  /tmp/docker-compose" | sha256sum -c -
+COMPOSE_ASSET="docker-compose-linux-$${ARCH}"
 mkdir -p /usr/libexec/docker/cli-plugins
-install -m 0755 /tmp/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
-rm -f /tmp/docker-compose /tmp/compose-checksums.txt
+(
+  cd /tmp
+  curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/$${COMPOSE_ASSET}" -o "$${COMPOSE_ASSET}"
+  curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/$${COMPOSE_ASSET}.sha256" -o "$${COMPOSE_ASSET}.sha256"
+  sha256sum -c "$${COMPOSE_ASSET}.sha256"
+  install -m 0755 "$${COMPOSE_ASSET}" /usr/libexec/docker/cli-plugins/docker-compose
+  rm -f "$${COMPOSE_ASSET}" "$${COMPOSE_ASSET}.sha256"
+)
 
 # cosign — pinned version, checksum-verified, used to verify the image signature
 # before we run it. Cosign release assets use Go-style arch names, so map from
@@ -40,12 +45,24 @@ case "$${ARCH}" in
   aarch64) COSIGN_ARCH="arm64" ;;
   *) echo "unsupported architecture for cosign: $${ARCH}" >&2; exit 1 ;;
 esac
-curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/cosign-linux-$${COSIGN_ARCH}" -o /tmp/cosign
-curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/cosign_checksums.txt" -o /tmp/cosign-checksums.txt
-COSIGN_SHA="$(grep " cosign-linux-$${COSIGN_ARCH}\$" /tmp/cosign-checksums.txt | awk '{print $1}')"
-echo "$${COSIGN_SHA}  /tmp/cosign" | sha256sum -c -
-install -m 0755 /tmp/cosign /usr/local/bin/cosign
-rm -f /tmp/cosign /tmp/cosign-checksums.txt
+COSIGN_ASSET="cosign-linux-$${COSIGN_ARCH}"
+(
+  cd /tmp
+  curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/$${COSIGN_ASSET}" -o "$${COSIGN_ASSET}"
+  curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/cosign_checksums.txt" -o cosign_checksums.txt
+  # `--ignore-missing` skips the other-platform entries in the checksums file,
+  # but on its own would silently exit 0 if NO files were checked — assert that
+  # the line we care about actually printed `OK` so we can't accidentally
+  # install an unverified binary.
+  VERIFY="$(sha256sum --ignore-missing -c cosign_checksums.txt 2>&1)"
+  echo "$${VERIFY}"
+  echo "$${VERIFY}" | grep -q "^$${COSIGN_ASSET}: OK\$" || {
+    echo "cosign checksum verify did not produce an OK line for $${COSIGN_ASSET}" >&2
+    exit 1
+  }
+  install -m 0755 "$${COSIGN_ASSET}" /usr/local/bin/cosign
+  rm -f "$${COSIGN_ASSET}" cosign_checksums.txt
+)
 
 # 2. Secrets → files. Private key as a 0600 file (multi-line PEM); webhook
 #    secret + Gemini key into the env file. The optional private-registry
