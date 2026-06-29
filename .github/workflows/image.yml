@@ -19,6 +19,12 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Gate the PUBLISH path (tag pushes) behind the `release` environment so a
+    # `git push --tags` can't ship a signed image unreviewed. Configure the
+    # `release` environment with required reviewers (Settings → Environments);
+    # consider also a tag ruleset restricting who can create `v*` tags. PR/main
+    # builds resolve to an empty environment name → no gate (they never push).
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || '' }}
     permissions:
       contents: read
       packages: write

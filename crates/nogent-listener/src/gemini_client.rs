@@ -3,9 +3,11 @@
 //! (agentic review).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use nogent_core::error::{NogentError, Result};
+use nogent_core::error::{redact_error_body, NogentError, Result};
 use nogent_core::gemini::{Content, GenerateRequest, GenerateResponse, Part, Tool};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
 
@@ -30,7 +32,6 @@ struct Usage {
 
 pub struct GeminiClient {
     http: reqwest::Client,
-    api_key: String,
     model: String,
     /// Reasoning level (e.g. "high") for thinking-capable models; None to omit.
     thinking_level: Option<String>,
@@ -39,10 +40,26 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub fn new(api_key: &str, model: &str, thinking_level: Option<&str>) -> Result<Self> {
-        let http = reqwest::Client::builder().user_agent("nogent").build()?;
+        // Bake the API key into default headers as a *sensitive* value so it
+        // doesn't sit in a plain `String` field and so tracing layers can
+        // detect and redact it instead of dumping the key into logs.
+        let mut key = HeaderValue::from_str(api_key).map_err(|e| {
+            NogentError::Auth(format!("Gemini API key is not a valid header value: {e}"))
+        })?;
+        key.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("x-goog-api-key"), key);
+
+        let http = reqwest::Client::builder()
+            .user_agent("nogent")
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .default_headers(headers)
+            .build()?;
         Ok(GeminiClient {
             http,
-            api_key: api_key.to_string(),
             model: model.to_string(),
             thinking_level: thinking_level.map(str::to_string),
             usage: Usage::default(),
@@ -63,19 +80,15 @@ impl GeminiClient {
 
     async fn post(&self, req: &GenerateRequest) -> Result<GenerateResponse> {
         let url = format!("{GEMINI_API}/v1beta/models/{}:generateContent", self.model);
-        let resp = self
-            .http
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(req)
-            .send()
-            .await?;
+        let resp = self.http.post(&url).json(req).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
             return Err(NogentError::GeminiApi {
                 status: status.as_u16(),
-                body,
+                // Gemini error bodies can echo prompt fragments (untrusted PR
+                // text); cap them before they hit operator logs.
+                body: redact_error_body(&body),
             });
         }
         let parsed: GenerateResponse = serde_json::from_str(&body).map_err(NogentError::from)?;

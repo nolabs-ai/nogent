@@ -128,8 +128,15 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     let Some((owner, repo)) = ev.repository.owner_repo() else {
         return Ok(());
     };
+    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
+        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
+        return Ok(());
+    }
 
-    let token = state.auth.installation_token(ev.installation.id).await?;
+    let token = state
+        .auth
+        .installation_token(ev.installation.id, owner, repo)
+        .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
     if !cfg.enabled || !cfg.pr_review_enabled {
         return Ok(());
@@ -165,8 +172,15 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
         tracing::warn!(%delivery, full_name = %ev.repository.full_name, "bad repo full_name");
         return Ok(());
     };
+    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
+        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
+        return Ok(());
+    }
 
-    let token = state.auth.installation_token(ev.installation.id).await?;
+    let token = state
+        .auth
+        .installation_token(ev.installation.id, owner, repo)
+        .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
     if !cfg.enabled || !cfg.pr_review_enabled {
         tracing::info!(%delivery, "PR review disabled by repo config");
@@ -199,8 +213,15 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
     let Some((owner, repo)) = ev.repository.owner_repo() else {
         return Ok(());
     };
+    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
+        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
+        return Ok(());
+    }
 
-    let token = state.auth.installation_token(ev.installation.id).await?;
+    let token = state
+        .auth
+        .installation_token(ev.installation.id, owner, repo)
+        .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
     if !cfg.enabled || !cfg.issue_triage_enabled {
         tracing::info!(%delivery, "issue triage disabled by repo config");

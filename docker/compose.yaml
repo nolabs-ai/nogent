@@ -7,11 +7,14 @@
 #   /etc/nogent/app-private-key.pem — the App private key (0600)
 #   ./Caddyfile                     — replace the domain + email
 #
-# Pin IMAGE_TAG to a released tag in production (e.g. export IMAGE_TAG=0.1.0).
+# IMAGE_TAG is REQUIRED — pin it to a released, signed tag (e.g.
+# `export IMAGE_TAG=0.1.0`). Defaulting to a mutable `:latest` let a stolen GHCR
+# token swap in an unsigned image; compose now refuses to start without a tag.
+# The Terraform host deploy additionally `cosign verify`s the image.
 
 services:
   nogent:
-    image: ghcr.io/nolabs-ai/nogent:${IMAGE_TAG:-latest}
+    image: ghcr.io/nolabs-ai/nogent:${IMAGE_TAG:?set IMAGE_TAG to a released, signed tag (e.g. 0.1.0)}
     # Bind all interfaces *inside the container*; only Caddy can reach it via
     # the internal network — the port is not published to the host.
     environment:

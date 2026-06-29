@@ -112,7 +112,7 @@ resource "aws_security_group_rule" "out_ntp" {
 # ── Secrets Manager (container only; set the value out-of-band) ──────────────
 resource "aws_secretsmanager_secret" "nogent" {
   name        = var.secret_name
-  description = "nogent secrets: github_app_private_key, github_webhook_secret, gemini_api_key (JSON). Value set out-of-band, NOT by Terraform."
+  description = "nogent secrets (JSON): github_app_private_key, github_webhook_secret, gemini_api_key, and optional image_registry_auth ('user:token' for a private registry). Value set out-of-band, NOT by Terraform."
   tags        = local.tags
 }
 
@@ -170,15 +170,19 @@ resource "aws_instance" "nogent" {
   associate_public_ip_address = true
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    region              = var.region
-    secret_arn          = aws_secretsmanager_secret.nogent.arn
-    domain              = var.domain
-    acme_email          = var.acme_email
-    github_app_id         = var.github_app_id
-    gemini_model          = var.gemini_model
-    gemini_thinking_level = var.gemini_thinking_level
-    image                 = var.image
-    image_registry_auth = var.image_registry_auth
+    region                  = var.region
+    secret_arn              = aws_secretsmanager_secret.nogent.arn
+    domain                  = var.domain
+    acme_email              = var.acme_email
+    github_app_id           = var.github_app_id
+    gemini_model            = var.gemini_model
+    gemini_thinking_level   = var.gemini_thinking_level
+    image                   = var.image
+    cosign_identity_regexp  = var.cosign_identity_regexp
+    cosign_oidc_issuer      = var.cosign_oidc_issuer
+    # NOTE: the private-registry credential is intentionally NOT passed here.
+    # It lives in the `image_registry_auth` key of the Secrets Manager secret
+    # and is read on the box, so it never lands in user-data / IMDS cleartext.
   })
   # Re-provision when user-data changes.
   user_data_replace_on_change = true

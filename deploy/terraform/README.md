@@ -12,7 +12,10 @@ and the EC2 instance whose user-data installs Docker, renders config, and
   out-of-band (below). Terraform only creates the empty secret + the IAM grant.
 - **The image.** CI builds + pushes `ghcr.io/nolabs-ai/nogent:<tag>` (see
   `.github/workflows/image.yml`). Pass the tag as `image`. For a private
-  registry, set `image_registry_auth = "user:token"`.
+  registry, put the `user:token` credential under the optional
+  `image_registry_auth` key of the Secrets Manager secret (below) — it is
+  intentionally NOT a Terraform variable, because user-data is served by IMDS
+  in cleartext to any process on the box.
 
 ## Usage
 
@@ -31,13 +34,17 @@ EOF
 terraform init
 terraform apply
 
-# Set the secret value (NOT in Terraform). Private key is the raw PEM.
+# Set the secret value (NOT in Terraform). Private key is the raw PEM. Add the
+# optional `image_registry_auth` key ("user:token") only if pulling from a
+# private registry — omit it for public images.
 aws secretsmanager put-secret-value \
   --secret-id "$(terraform output -raw secret_arn)" \
   --secret-string "$(jq -n \
       --rawfile k /path/to/app-private-key.pem \
       --arg w "$WEBHOOK_SECRET" --arg g "$GEMINI_API_KEY" \
-      '{github_app_private_key:$k, github_webhook_secret:$w, gemini_api_key:$g}')"
+      --arg r "${IMAGE_REGISTRY_AUTH:-}" \
+      '{github_app_private_key:$k, github_webhook_secret:$w, gemini_api_key:$g}
+        + (if $r == "" then {} else {image_registry_auth:$r} end)')"
 
 # Re-run bootstrap so it picks up the secret (or just reboot the instance):
 aws ssm start-session --target "$(terraform output -raw instance_id)"

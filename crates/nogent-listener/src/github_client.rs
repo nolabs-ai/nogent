@@ -3,8 +3,11 @@
 //! (Without nono there is no proxy/phantom indirection; the listener holds the
 //! real token and calls GitHub directly.)
 
+use std::time::Duration;
+
 use nogent_core::diff_digest::ChangedFile;
-use nogent_core::error::{NogentError, Result};
+use nogent_core::error::{redact_error_body, NogentError, Result};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT as ACCEPT_HEADER, AUTHORIZATION};
 use serde::Serialize;
 use serde_json::json;
 
@@ -37,16 +40,38 @@ fn urlencode_segment(seg: &str) -> String {
 
 pub struct GithubClient {
     http: reqwest::Client,
-    token: String,
 }
 
 impl GithubClient {
     pub fn new(token: &str) -> Result<Self> {
-        let http = reqwest::Client::builder().user_agent("nogent").build()?;
-        Ok(GithubClient {
-            http,
-            token: token.to_string(),
-        })
+        // Bake Authorization + X-GitHub-Api-Version into default headers so the
+        // token bytes don't sit in a plain `String` field for the client's
+        // lifetime, and so the bearer is marked sensitive (tracing layers like
+        // tower_http will print `Sensitive` instead of the value).
+        let mut auth = HeaderValue::from_str(&format!("token {token}"))
+            .map_err(|e| NogentError::Auth(format!("token is not a valid header value: {e}")))?;
+        auth.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, auth);
+        headers.insert(
+            HeaderName::from_static("x-github-api-version"),
+            HeaderValue::from_static(API_VERSION),
+        );
+
+        let http = reqwest::Client::builder()
+            .user_agent("nogent")
+            // Bound total + connect time: a stalled upstream must not pin a
+            // webhook spawn indefinitely.
+            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(5))
+            // Cap redirect chains. We can't use Policy::none() because the
+            // tarball endpoint legitimately 302s to codeload.github.com.
+            .redirect(reqwest::redirect::Policy::limited(3))
+            // Refuse any plaintext leg even via redirect.
+            .https_only(true)
+            .default_headers(headers)
+            .build()?;
+        Ok(GithubClient { http })
     }
 
     fn url(&self, path: &str) -> String {
@@ -64,9 +89,7 @@ impl GithubClient {
         let resp = self
             .http
             .get(self.url(&path))
-            .header("Authorization", format!("token {}", self.token))
-            .header("Accept", ACCEPT)
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(ACCEPT_HEADER, ACCEPT)
             .send()
             .await?;
         let status = resp.status();
@@ -74,7 +97,7 @@ impl GithubClient {
         if !status.is_success() {
             return Err(NogentError::GitHubApi {
                 status: status.as_u16(),
-                body,
+                body: redact_error_body(&body),
             });
         }
         let files: Vec<ChangedFile> = serde_json::from_str(&body)?;
@@ -103,10 +126,8 @@ impl GithubClient {
         let resp = self
             .http
             .get(&url)
-            .header("Authorization", format!("token {}", self.token))
             // Raw media type returns the file body directly (not base64 JSON).
-            .header("Accept", "application/vnd.github.raw+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(ACCEPT_HEADER, "application/vnd.github.raw+json")
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -140,9 +161,7 @@ impl GithubClient {
         let resp = self
             .http
             .get(self.url(&path))
-            .header("Authorization", format!("token {}", self.token))
-            .header("Accept", ACCEPT)
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(ACCEPT_HEADER, ACCEPT)
             .send()
             .await?;
         let status = resp.status();
@@ -150,7 +169,7 @@ impl GithubClient {
         if !status.is_success() {
             return Err(NogentError::GitHubApi {
                 status: status.as_u16(),
-                body,
+                body: redact_error_body(&body),
             });
         }
         serde_json::from_str(&body).map_err(NogentError::from)
@@ -198,9 +217,7 @@ impl GithubClient {
         let resp = self
             .http
             .get(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .header("Accept", ACCEPT)
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(ACCEPT_HEADER, ACCEPT)
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -266,9 +283,7 @@ impl GithubClient {
         let resp = self
             .http
             .post(self.url(path))
-            .header("Authorization", format!("token {}", self.token))
-            .header("Accept", ACCEPT)
-            .header("X-GitHub-Api-Version", API_VERSION)
+            .header(ACCEPT_HEADER, ACCEPT)
             .json(payload)
             .send()
             .await?;
@@ -277,7 +292,7 @@ impl GithubClient {
             let body = resp.text().await?;
             return Err(NogentError::GitHubApi {
                 status: status.as_u16(),
-                body,
+                body: redact_error_body(&body),
             });
         }
         Ok(())
