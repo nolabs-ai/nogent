@@ -11,6 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+/// Floor for an individual file's patch budget, so a small file still gets
+/// useful context even when many files share `max_patch_bytes`. The floor is
+/// always clamped by the cumulative `remaining` counter in `build_digest`, so
+/// it can never push the *total* digest size past `max_patch_bytes`.
+const MIN_PER_FILE_BYTES: usize = 2_000;
+
 /// A single changed file as returned by GitHub's "list pull request files" API.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChangedFile {
@@ -56,13 +62,26 @@ pub fn build_digest(files: &[ChangedFile], max_files: usize, max_patch_bytes: us
     // Per-file budget: split the byte budget across selected files, with a
     // floor so individual small files still get useful context. saturating_*
     // and a guarded divisor keep this panic-free.
+    //
+    // The floor is bounded by a SINGLE cumulative counter (`remaining`): each
+    // file may use up to its share-or-floor, but never more than what is left
+    // of `max_patch_bytes`. Without this, `max(FLOOR)` let total prompt bytes
+    // scale to `max_files × FLOOR` and bypass a smaller `maxPatchBytes`.
     let denom = selected.len().max(1);
-    let per_file_budget = (max_patch_bytes / denom).max(2_000);
+    let per_file_budget = (max_patch_bytes / denom).max(MIN_PER_FILE_BYTES);
+    let mut remaining = max_patch_bytes;
 
     let mut sections: Vec<String> = Vec::with_capacity(selected.len());
     for f in selected {
         let patch = match &f.patch {
-            Some(p) => annotate_patch(&truncate_on_char_boundary(p, per_file_budget)),
+            Some(p) => {
+                let budget = per_file_budget.min(remaining);
+                let truncated = truncate_on_char_boundary(p, budget);
+                // Charge the cumulative counter for the patch bytes retained
+                // (the truncation marker is fixed overhead, not attacker text).
+                remaining = remaining.saturating_sub(p.len().min(budget));
+                annotate_patch(&truncated)
+            }
             None => "[no text patch available]".to_string(),
         };
         sections.push(format!(
@@ -473,14 +492,41 @@ mod tests {
 
     #[test]
     fn per_file_budget_has_floor() {
-        // Many files + small total budget → floor of 2000 bytes per file.
+        // Even share (10_000/10 = 1000) is below the floor (2000), so early
+        // files get up to the floor rather than the smaller even share. Total
+        // demand (30_000) exceeds the cap (10_000), so the cumulative counter
+        // still bounds the digest — the floor only redistributes, never grows
+        // the total.
+        let big = "x".repeat(3_000);
+        let files: Vec<_> = (0..10)
+            .map(|i| file(&format!("f{i}"), Some(&big)))
+            .collect();
+        let d = build_digest(&files, 10, 10_000);
+        assert!(d.text.contains("[patch truncated]"));
+        // First file's section (everything before "File: f1").
+        let first = d.text.split("File: f1\n").next().unwrap();
+        let x = first.matches('x').count();
+        assert!(x >= 2_000, "first file got {x} bytes, expected the 2000 floor");
+        assert!(x < 3_000, "first file got {x} bytes, floor should cap below full size");
+    }
+
+    #[test]
+    fn cumulative_bytes_bounded_by_max_patch_bytes() {
+        // Many files, each larger than the whole budget. The per-file floor must
+        // NOT let the total scale to max_files × floor — the cumulative counter
+        // caps retained patch bytes at max_patch_bytes regardless of file count.
         let big = "x".repeat(10_000);
         let files: Vec<_> = (0..100)
             .map(|i| file(&format!("f{i}"), Some(&big)))
             .collect();
-        let d = build_digest(&files, 100, 1_000); // 1000/100 = 10 < floor
-        // Each section's patch is truncated to >= 2000 bytes (floor), so the
-        // truncation marker appears.
-        assert!(d.text.contains("[patch truncated]"));
+        let max = 5_000;
+        let d = build_digest(&files, 100, max);
+        // Patch content is all 'x'; annotation/markers add no 'x'. Total
+        // retained attacker-controlled bytes must not exceed the bound.
+        let content_bytes = d.text.matches('x').count();
+        assert!(
+            content_bytes <= max,
+            "retained content {content_bytes} exceeded max_patch_bytes {max}"
+        );
     }
 }

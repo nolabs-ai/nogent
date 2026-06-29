@@ -67,11 +67,21 @@ variable "image" {
   description = "Fully-qualified nogent container image, e.g. ghcr.io/nolabs-ai/nogent:0.1.0."
 }
 
-variable "image_registry_auth" {
+# NOTE: the private-registry credential is NOT a Terraform variable any more —
+# putting it here templated it into user-data, which IMDS serves in cleartext.
+# Set it as the optional `image_registry_auth` key in the Secrets Manager secret
+# instead (read on the box at boot).
+
+variable "cosign_identity_regexp" {
   type        = string
-  sensitive   = true
-  description = "Optional `docker login` credential for a private image registry, as 'user:token'. Leave empty for a public image."
-  default     = ""
+  description = "Regexp the image's keyless-signing certificate identity must match (the publishing GitHub Actions workflow ref). Bootstrap refuses to start an image that fails `cosign verify` against this."
+  default     = "^https://github\\.com/nolabs-ai/nogent/\\.github/workflows/image\\.yml@refs/tags/v.*$"
+}
+
+variable "cosign_oidc_issuer" {
+  type        = string
+  description = "OIDC issuer that signed the image. GitHub Actions keyless signing uses the Actions token issuer."
+  default     = "https://token.actions.githubusercontent.com"
 }
 
 variable "acme_email" {

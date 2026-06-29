@@ -2,21 +2,55 @@
 # nogent bootstrap (container deploy). Terraform interpolations are $${...}-escaped
 # where they are bash variables; bare $${...} are Terraform template values.
 set -euo pipefail
+# Create the bootstrap log 0600 BEFORE redirecting into it: it captures the
+# whole run (incl. the secret-handling region below, which we additionally
+# silence) and must never be world-readable.
+install -m 0600 /dev/null /var/log/nogent-bootstrap.log
 exec > >(tee -a /var/log/nogent-bootstrap.log) 2>&1
 echo "=== nogent bootstrap $(date -u) ==="
 
-# 1. Packages: docker + compose plugin, jq (secret parsing), chrony (clock).
+# Pinned tool versions. Each binary is verified against the checksum published
+# in the SAME immutable release tag, so a bad/tampered download fails loudly
+# instead of installing silently.
+COMPOSE_VERSION="v2.32.4"
+COSIGN_VERSION="v2.4.1"
+
+# 1. Packages: docker + jq (secret parsing), chrony (clock).
 dnf install -y docker jq chrony
 systemctl enable --now chronyd
 systemctl enable --now docker
-# compose v2 plugin
+
+# compose v2 plugin — pinned version, checksum-verified against the release's
+# checksums.txt (no `releases/latest`, no unverified curl|install as root).
+ARCH="$(uname -m)"
+curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-$${ARCH}" -o /tmp/docker-compose
+curl -fsSL "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/checksums.txt" -o /tmp/compose-checksums.txt
+COMPOSE_SHA="$(grep " docker-compose-linux-$${ARCH}\$" /tmp/compose-checksums.txt | awk '{print $1}')"
+echo "$${COMPOSE_SHA}  /tmp/docker-compose" | sha256sum -c -
 mkdir -p /usr/libexec/docker/cli-plugins
-curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)" \
-  -o /usr/libexec/docker/cli-plugins/docker-compose
-chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
+install -m 0755 /tmp/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+rm -f /tmp/docker-compose /tmp/compose-checksums.txt
+
+# cosign — pinned version, checksum-verified, used to verify the image signature
+# before we run it. Cosign release assets use Go-style arch names, so map from
+# `uname -m` (x86_64 / aarch64) to cosign's (amd64 / arm64); anything else is
+# unsupported and we fail loudly rather than guessing.
+case "$${ARCH}" in
+  x86_64)  COSIGN_ARCH="amd64" ;;
+  aarch64) COSIGN_ARCH="arm64" ;;
+  *) echo "unsupported architecture for cosign: $${ARCH}" >&2; exit 1 ;;
+esac
+curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/cosign-linux-$${COSIGN_ARCH}" -o /tmp/cosign
+curl -fsSL "https://github.com/sigstore/cosign/releases/download/$${COSIGN_VERSION}/cosign_checksums.txt" -o /tmp/cosign-checksums.txt
+COSIGN_SHA="$(grep " cosign-linux-$${COSIGN_ARCH}\$" /tmp/cosign-checksums.txt | awk '{print $1}')"
+echo "$${COSIGN_SHA}  /tmp/cosign" | sha256sum -c -
+install -m 0755 /tmp/cosign /usr/local/bin/cosign
+rm -f /tmp/cosign /tmp/cosign-checksums.txt
 
 # 2. Secrets → files. Private key as a 0600 file (multi-line PEM); webhook
-#    secret + Gemini key into the env file.
+#    secret + Gemini key into the env file. The optional private-registry
+#    credential lives in the same secret, NOT in user-data (which IMDS serves
+#    in cleartext to any process on the box).
 # 0755 so the non-root container user (uid 65532) can traverse the dir to
 # read the bind-mounted PEM. Files inside stay restrictive (PEM 0640 uid 65532,
 # env file 0600 root).
@@ -25,12 +59,19 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
   --region ${region} --secret-id ${secret_arn} \
   --query SecretString --output text)"
 
-umask 077
-echo "$${SECRET_JSON}" | jq -r '.github_app_private_key' > /etc/nogent/app-private-key.pem
-GH_WEBHOOK_SECRET="$(echo "$${SECRET_JSON}" | jq -r '.github_webhook_secret')"
-GEMINI_API_KEY="$(echo "$${SECRET_JSON}" | jq -r '.gemini_api_key')"
+# Everything touching secret material runs with tracing off and stderr/stdout
+# discarded, so a future `set -x` (or a jq error echoing input) cannot leak the
+# PEM / keys into the bootstrap log. Values are only ever written to 0600 files.
+IMAGE_REGISTRY_AUTH=""
+{
+  set +x
+  umask 077
+  echo "$${SECRET_JSON}" | jq -r '.github_app_private_key' > /etc/nogent/app-private-key.pem
+  GH_WEBHOOK_SECRET="$(echo "$${SECRET_JSON}" | jq -r '.github_webhook_secret')"
+  GEMINI_API_KEY="$(echo "$${SECRET_JSON}" | jq -r '.gemini_api_key')"
+  IMAGE_REGISTRY_AUTH="$(echo "$${SECRET_JSON}" | jq -r '.image_registry_auth // empty')"
 
-cat > /etc/nogent/nogent.env <<EOF
+  cat > /etc/nogent/nogent.env <<EOF
 GITHUB_APP_ID=${github_app_id}
 GITHUB_APP_PRIVATE_KEY_FILE=/etc/nogent/app-private-key.pem
 GITHUB_WEBHOOK_SECRET=$${GH_WEBHOOK_SECRET}
@@ -39,6 +80,9 @@ GEMINI_MODEL=${gemini_model}
 GEMINI_THINKING_LEVEL=${gemini_thinking_level}
 RUST_LOG=info
 EOF
+} 2>/dev/null
+unset SECRET_JSON GH_WEBHOOK_SECRET GEMINI_API_KEY
+
 # The container runs as uid 65532 (Chainguard distroless `nonroot`) and reads
 # the PEM via a read-only bind mount, so it needs to be readable by that uid.
 # The env file is read by the docker daemon (host root) and injected, so it
@@ -47,12 +91,15 @@ chown 65532:65532 /etc/nogent/app-private-key.pem
 chmod 0640 /etc/nogent/app-private-key.pem
 chmod 0600 /etc/nogent/nogent.env
 
-# 3. Optional private-registry login.
-if [ -n "${image_registry_auth}" ]; then
-  echo "${image_registry_auth}" | cut -d: -f2- | \
-    docker login "$(echo '${image}' | cut -d/ -f1)" \
-      -u "$(echo '${image_registry_auth}' | cut -d: -f1)" --password-stdin
+# 3. Optional private-registry login (credential sourced from the secret).
+if [ -n "$${IMAGE_REGISTRY_AUTH}" ]; then
+  { set +x
+    echo "$${IMAGE_REGISTRY_AUTH}" | cut -d: -f2- | \
+      docker login "$(echo '${image}' | cut -d/ -f1)" \
+        -u "$(echo "$${IMAGE_REGISTRY_AUTH}" | cut -d: -f1)" --password-stdin
+  } 2>/dev/null
 fi
+unset IMAGE_REGISTRY_AUTH
 
 # 4. Compose project (listener + Caddy). Caddy is the only public listener.
 install -d -m 0755 /opt/nogent
@@ -108,7 +155,16 @@ volumes:
   caddy_config:
 EOF
 
-# 5. Up.
+# 5. Pull, verify the keyless signature against the publishing workflow's OIDC
+#    identity, THEN run. A stolen GHCR token cannot ship an unsigned image: the
+#    verify gate fails closed and `up` never executes.
+#    Verify the exact DIGEST that was pulled (not the mutable tag) so the tag
+#    can't be swapped between verify and run; `up` then reuses the local image.
 docker compose -f /opt/nogent/compose.yaml pull
+IMAGE_DIGEST="$(docker image inspect --format '{{ index .RepoDigests 0 }}' "${image}")"
+cosign verify \
+  --certificate-identity-regexp "${cosign_identity_regexp}" \
+  --certificate-oidc-issuer "${cosign_oidc_issuer}" \
+  "$${IMAGE_DIGEST}"
 docker compose -f /opt/nogent/compose.yaml up -d
 echo "=== nogent bootstrap complete ==="
