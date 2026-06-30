@@ -216,11 +216,17 @@ mod tests {
     #[test]
     fn parses_github_expires_at() {
         // 2026-06-29T00:00:00Z = 1782691200 unix seconds.
-        assert_eq!(parse_rfc3339_secs("2026-06-29T00:00:00Z"), Some(1_782_691_200));
+        assert_eq!(
+            parse_rfc3339_secs("2026-06-29T00:00:00Z"),
+            Some(1_782_691_200)
+        );
         // Epoch.
         assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
         // A known leap-day timestamp: 2024-02-29T12:00:00Z = 1709208000.
-        assert_eq!(parse_rfc3339_secs("2024-02-29T12:00:00Z"), Some(1_709_208_000));
+        assert_eq!(
+            parse_rfc3339_secs("2024-02-29T12:00:00Z"),
+            Some(1_709_208_000)
+        );
         // Fractional seconds tolerated (integer part only).
         assert_eq!(
             parse_rfc3339_secs("2026-06-29T00:00:01.500Z"),
@@ -242,7 +248,9 @@ mod tests {
         assert!(fallback > Instant::now() + Duration::from_secs(40 * 60));
 
         // Unparseable → same fallback.
-        assert!(AppAuth::refresh_after(Some("garbage")) > Instant::now() + Duration::from_secs(40 * 60));
+        assert!(
+            AppAuth::refresh_after(Some("garbage")) > Instant::now() + Duration::from_secs(40 * 60)
+        );
     }
 
     #[test]

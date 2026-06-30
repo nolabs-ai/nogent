@@ -396,8 +396,7 @@ mod tests {
 
     #[test]
     fn annotate_patch_resets_counter_per_hunk() {
-        let patch =
-            "@@ -1 +1,2 @@\n+first_a\n+first_b\n@@ -10 +100,2 @@\n+second_a\n+second_b\n";
+        let patch = "@@ -1 +1,2 @@\n+first_a\n+first_b\n@@ -10 +100,2 @@\n+second_a\n+second_b\n";
         let out = annotate_patch(patch);
         assert!(out.contains("L1     "));
         assert!(out.contains("L2     "));
@@ -506,8 +505,14 @@ mod tests {
         // First file's section (everything before "File: f1").
         let first = d.text.split("File: f1\n").next().unwrap();
         let x = first.matches('x').count();
-        assert!(x >= 2_000, "first file got {x} bytes, expected the 2000 floor");
-        assert!(x < 3_000, "first file got {x} bytes, floor should cap below full size");
+        assert!(
+            x >= 2_000,
+            "first file got {x} bytes, expected the 2000 floor"
+        );
+        assert!(
+            x < 3_000,
+            "first file got {x} bytes, floor should cap below full size"
+        );
     }
 
     #[test]

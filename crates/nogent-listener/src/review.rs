@@ -136,8 +136,8 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
                     let content = line_content.get(&f.file);
                     Some(snap_to_token_match(l, commentable, content, &f.description))
                 });
-                let anchored = snapped
-                    .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
+                let anchored =
+                    snapped.filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
                 match anchored {
                     Some(line) => inline.push(InlineComment {
                         path: f.file.clone(),
@@ -585,7 +585,10 @@ mod tests {
     fn backticked_tokens_extracts_code_quotes() {
         let s = "Use `pickle.loads` on `request.get_data()` — RCE in `import_state`.";
         let toks = backticked_tokens(s);
-        assert_eq!(toks, vec!["pickle.loads", "request.get_data()", "import_state"]);
+        assert_eq!(
+            toks,
+            vec!["pickle.loads", "request.get_data()", "import_state"]
+        );
     }
 
     #[test]

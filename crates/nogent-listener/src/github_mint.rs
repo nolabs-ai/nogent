@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use nogent_core::error::{redact_error_body, NogentError, Result};
+use nogent_core::error::{NogentError, Result, redact_error_body};
 use serde::Deserialize;
 use serde_json::json;
 use zeroize::Zeroizing;

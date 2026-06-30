@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nogent_core::error::{redact_error_body, NogentError, Result};
+use nogent_core::error::{NogentError, Result, redact_error_body};
 use nogent_core::gemini::{Content, GenerateRequest, GenerateResponse, Part, Tool};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 

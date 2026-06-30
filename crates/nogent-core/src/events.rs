@@ -225,7 +225,8 @@ mod tests {
     #[test]
     fn actor_type_drives_is_bot() {
         let human: Actor = serde_json::from_str(r#"{"login":"alice","type":"User"}"#).unwrap();
-        let bot: Actor = serde_json::from_str(r#"{"login":"dependabot[bot]","type":"Bot"}"#).unwrap();
+        let bot: Actor =
+            serde_json::from_str(r#"{"login":"dependabot[bot]","type":"Bot"}"#).unwrap();
         let bot_lower: Actor = serde_json::from_str(r#"{"login":"x","type":"bot"}"#).unwrap();
         let missing: Actor = serde_json::from_str(r#"{"login":"legacy"}"#).unwrap();
         assert!(!human.is_bot());
