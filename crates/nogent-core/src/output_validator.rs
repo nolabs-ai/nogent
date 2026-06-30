@@ -14,6 +14,8 @@ use serde::Deserialize;
 pub const FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming security review for this change \
 (the model output failed canary/shape validation). A maintainer should review manually.";
 
+pub const ISSUE_TRIAGE_MARKER: &str = "<!-- nogent:issue-triage -->";
+
 const MAX_ITEMS: usize = 30;
 const MAX_FINDING_DESC: usize = 1_500;
 const MAX_FIELD_LEN: usize = 300;
@@ -403,6 +405,8 @@ pub fn validate_issue_triage(raw: &str, expected_canary: &str) -> Option<IssueTr
 #[must_use]
 pub fn format_issue_triage_markdown(out: &IssueTriageOutput) -> String {
     let mut s = String::new();
+    s.push_str(ISSUE_TRIAGE_MARKER);
+    s.push_str("\n\n");
     s.push_str("## 🛡️ nogent issue triage\n\n");
     if !out.verdict.is_empty() {
         s.push_str(&format!("**Assessment:** {}\n\n", out.verdict));

@@ -3,7 +3,8 @@
 use nogent_core::error::Result;
 use nogent_core::events::EventJob;
 use nogent_core::output_validator::{
-    FALLBACK_MESSAGE, format_issue_triage_markdown, generate_canary, validate_issue_triage,
+    FALLBACK_MESSAGE, ISSUE_TRIAGE_MARKER, format_issue_triage_markdown, generate_canary,
+    validate_issue_triage,
 };
 use nogent_core::prompts::issue_triage;
 
@@ -41,12 +42,11 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
                 raw = %raw.chars().take(6000).collect::<String>(),
                 "model output failed validation; posting fallback"
             );
-            FALLBACK_MESSAGE.to_string()
+            format!("{ISSUE_TRIAGE_MARKER}\n\n{FALLBACK_MESSAGE}")
         }
     };
 
-    gh.post_issue_comment(&job.owner, &job.repo, job.number, &body)
-        .await?;
+    post_or_update_triage_comment(&gh, job, &body).await?;
     let u = gemini.usage();
     tracing::info!(
         issue = job.number,
@@ -58,4 +58,72 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
         "posted issue triage"
     );
     Ok(())
+}
+
+async fn post_or_update_triage_comment(
+    gh: &GithubClient,
+    job: &EventJob,
+    body: &str,
+) -> Result<()> {
+    let comments = gh
+        .list_issue_comments(&job.owner, &job.repo, job.number)
+        .await?;
+    let triage_comments = comments
+        .into_iter()
+        .filter(|c| c.user.is_bot() && is_issue_triage_comment(&c.body))
+        .collect::<Vec<_>>();
+
+    let Some((first, duplicates)) = triage_comments.split_first() else {
+        gh.post_issue_comment(&job.owner, &job.repo, job.number, body)
+            .await?;
+        return Ok(());
+    };
+
+    gh.update_issue_comment(&job.owner, &job.repo, first.id, body)
+        .await?;
+    for duplicate in duplicates {
+        if let Err(err) = gh
+            .delete_issue_comment(&job.owner, &job.repo, duplicate.id)
+            .await
+        {
+            tracing::warn!(
+                issue = job.number,
+                comment_id = duplicate.id,
+                error = %err,
+                "failed to delete duplicate issue triage comment"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_issue_triage_comment(body: &str) -> bool {
+    body.contains(ISSUE_TRIAGE_MARKER) || body.contains("## 🛡️ nogent issue triage")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_issue_triage_comment;
+    use nogent_core::output_validator::ISSUE_TRIAGE_MARKER;
+
+    #[test]
+    fn detects_current_marker() {
+        assert!(is_issue_triage_comment(&format!(
+            "{ISSUE_TRIAGE_MARKER}\n\n## 🛡️ nogent issue triage"
+        )));
+    }
+
+    #[test]
+    fn detects_legacy_heading() {
+        assert!(is_issue_triage_comment(
+            "## 🛡️ nogent issue triage\n\n**Assessment:** needs-code-change"
+        ));
+    }
+
+    #[test]
+    fn ignores_other_bot_comments() {
+        assert!(!is_issue_triage_comment(
+            "## unrelated\n\nAutomated triage suggestion."
+        ));
+    }
 }

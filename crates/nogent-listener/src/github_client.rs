@@ -6,9 +6,10 @@
 use std::time::Duration;
 
 use nogent_core::diff_digest::ChangedFile;
-use nogent_core::error::{redact_error_body, NogentError, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT as ACCEPT_HEADER, AUTHORIZATION};
-use serde::Serialize;
+use nogent_core::error::{NogentError, Result, redact_error_body};
+use nogent_core::events::Actor;
+use reqwest::header::{ACCEPT as ACCEPT_HEADER, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// An inline review comment anchored to a line of the diff (new side).
@@ -18,6 +19,14 @@ pub struct InlineComment {
     pub line: u64,
     pub side: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueComment {
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    pub user: Actor,
 }
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -277,6 +286,88 @@ impl GithubClient {
     ) -> Result<()> {
         let path = format!("/repos/{owner}/{repo}/issues/{number}/comments");
         self.post_json(&path, &json!({ "body": body })).await
+    }
+
+    /// List issue comments, bounded to the first 100 oldest comments.
+    pub async fn list_issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<IssueComment>> {
+        let path = format!("/repos/{owner}/{repo}/issues/{number}/comments?per_page=100");
+        let resp = self
+            .http
+            .get(self.url(&path))
+            .header(ACCEPT_HEADER, ACCEPT)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(NogentError::GitHubApi {
+                status: status.as_u16(),
+                body: redact_error_body(&body),
+            });
+        }
+        serde_json::from_str(&body).map_err(NogentError::from)
+    }
+
+    /// Update an issue comment in place.
+    pub async fn update_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<()> {
+        let path = format!("/repos/{owner}/{repo}/issues/comments/{comment_id}");
+        self.patch_json(&path, &json!({ "body": body })).await
+    }
+
+    /// Delete an issue comment.
+    pub async fn delete_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+    ) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!(
+                "/repos/{owner}/{repo}/issues/comments/{comment_id}"
+            )))
+            .header(ACCEPT_HEADER, ACCEPT)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await?;
+            return Err(NogentError::GitHubApi {
+                status: status.as_u16(),
+                body: redact_error_body(&body),
+            });
+        }
+        Ok(())
+    }
+
+    async fn patch_json(&self, path: &str, payload: &serde_json::Value) -> Result<()> {
+        let resp = self
+            .http
+            .patch(self.url(path))
+            .header(ACCEPT_HEADER, ACCEPT)
+            .json(payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await?;
+            return Err(NogentError::GitHubApi {
+                status: status.as_u16(),
+                body: redact_error_body(&body),
+            });
+        }
+        Ok(())
     }
 
     async fn post_json(&self, path: &str, payload: &serde_json::Value) -> Result<()> {
