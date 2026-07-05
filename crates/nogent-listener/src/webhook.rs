@@ -116,13 +116,11 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     let ev: nogent_core::events::IssueCommentEvent = serde_json::from_slice(body)
         .map_err(|e| nogent_core::NogentError::Payload(format!("issue_comment: {e}")))?;
 
-    // Only created/edited comments, only on PRs, only the exact command,
-    // and not from a bot (prevents loops where another bot echoes the command).
-    if !matches!(ev.action.as_str(), "created" | "edited")
-        || ev.issue.pull_request.is_none()
-        || !events::is_review_command(&ev.comment.body)
-        || ev.comment.user.is_bot()
-    {
+    // Only created/edited comments, only on PRs, only the exact command.
+    //
+    // Bot-authored command comments are allowed intentionally: many teams route
+    // slash commands through GitHub Actions or another automation account.
+    if !is_review_command_event(&ev) {
         return Ok(());
     }
     let Some((owner, repo)) = ev.repository.owner_repo() else {
@@ -152,6 +150,12 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     review::run(&state.cfg, &token, &job).await?;
     tracing::info!(%delivery, pr = ev.issue.number, "reviewed PR on /nogent review");
     Ok(())
+}
+
+fn is_review_command_event(ev: &nogent_core::events::IssueCommentEvent) -> bool {
+    matches!(ev.action.as_str(), "created" | "edited")
+        && ev.issue.pull_request.is_some()
+        && events::is_review_command(&ev.comment.body)
 }
 
 async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
@@ -258,4 +262,59 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
 async fn resolve_config(token: &str, owner: &str, repo: &str) -> Result<ResolvedConfig> {
     let raw = github_mint::fetch_repo_config(token, owner, repo).await?;
     ResolvedConfig::resolve(raw.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use nogent_core::events::{Actor, Comment, Installation, Issue, IssueCommentEvent, Repository};
+
+    use super::is_review_command_event;
+
+    fn command_event(body: &str, user_type: &str) -> IssueCommentEvent {
+        IssueCommentEvent {
+            action: "created".to_string(),
+            installation: Installation { id: 1 },
+            repository: Repository {
+                full_name: "owner/repo".to_string(),
+                default_branch: "main".to_string(),
+            },
+            issue: Issue {
+                number: 7,
+                title: "pr".to_string(),
+                body: None,
+                html_url: "https://github.example/owner/repo/pull/7".to_string(),
+                user: Actor {
+                    login: "alice".to_string(),
+                    user_type: "User".to_string(),
+                },
+                pull_request: Some(serde_json::json!({"url": "https://api.example/pr/7"})),
+            },
+            comment: Comment {
+                body: body.to_string(),
+                user: Actor {
+                    login: "automation[bot]".to_string(),
+                    user_type: user_type.to_string(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn review_command_allows_bot_authored_comments() {
+        let ev = command_event("/nogent review", "Bot");
+        assert!(is_review_command_event(&ev));
+    }
+
+    #[test]
+    fn review_command_requires_exact_line() {
+        let ev = command_event("/nogent review please", "User");
+        assert!(!is_review_command_event(&ev));
+    }
+
+    #[test]
+    fn review_command_requires_pr_comment() {
+        let mut ev = command_event("/nogent review", "User");
+        ev.issue.pull_request = None;
+        assert!(!is_review_command_event(&ev));
+    }
 }
