@@ -14,6 +14,10 @@ use serde::Deserialize;
 pub const FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming security review for this change \
 (the model output failed canary/shape validation). A maintainer should review manually.";
 
+/// Posted when issue-triage output fails validation.
+pub const ISSUE_TRIAGE_FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming triage analysis for this issue \
+(the model output failed canary/shape validation). A maintainer should review manually.";
+
 pub const ISSUE_TRIAGE_MARKER: &str = "<!-- nogent:issue-triage -->";
 
 pub const ISSUE_TRIAGE_FOOTER: &str = "Thanks for raising this issue, our maintainers often have a large amount of issues to work through. To help us resolve this for you more quickly, jump onto our discord, post the link and help us get more context and figure out a solution: https://discord.gg/G6qDa7cC7x";
@@ -434,7 +438,7 @@ pub fn format_issue_triage_markdown(out: &IssueTriageOutput) -> String {
 /// Render the fixed fallback used when model output fails validation.
 #[must_use]
 pub fn format_issue_triage_fallback_markdown() -> String {
-    format!("{ISSUE_TRIAGE_MARKER}\n\n{FALLBACK_MESSAGE}\n\n{ISSUE_TRIAGE_FOOTER}")
+    format!("{ISSUE_TRIAGE_MARKER}\n\n{ISSUE_TRIAGE_FALLBACK_MESSAGE}\n\n{ISSUE_TRIAGE_FOOTER}")
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -656,6 +660,9 @@ mod tests {
         };
 
         assert!(format_issue_triage_markdown(&out).ends_with(ISSUE_TRIAGE_FOOTER));
-        assert!(format_issue_triage_fallback_markdown().ends_with(ISSUE_TRIAGE_FOOTER));
+        let fallback = format_issue_triage_fallback_markdown();
+        assert!(fallback.contains(ISSUE_TRIAGE_FALLBACK_MESSAGE));
+        assert!(!fallback.contains(FALLBACK_MESSAGE));
+        assert!(fallback.ends_with(ISSUE_TRIAGE_FOOTER));
     }
 }
