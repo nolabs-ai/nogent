@@ -3,8 +3,8 @@
 use nogent_core::error::Result;
 use nogent_core::events::EventJob;
 use nogent_core::output_validator::{
-    FALLBACK_MESSAGE, ISSUE_TRIAGE_MARKER, format_issue_triage_markdown, generate_canary,
-    validate_issue_triage,
+    ISSUE_TRIAGE_MARKER, format_issue_triage_fallback_markdown, format_issue_triage_markdown,
+    generate_canary, validate_issue_triage,
 };
 use nogent_core::prompts::issue_triage;
 
@@ -42,7 +42,7 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
                 raw = %raw.chars().take(6000).collect::<String>(),
                 "model output failed validation; posting fallback"
             );
-            format!("{ISSUE_TRIAGE_MARKER}\n\n{FALLBACK_MESSAGE}")
+            format_issue_triage_fallback_markdown()
         }
     };
 
