@@ -27,6 +27,22 @@ pub struct ListenerConfig {
     /// Installation IDs allowed to use this listener. Empty = no restriction.
     /// Populated from `NOGENT_ALLOWED_INSTALLATIONS` (comma-separated u64s).
     pub allowed_installations: Vec<u64>,
+    /// How untrusted review and triage jobs are executed.
+    pub worker_isolation: WorkerIsolation,
+    /// Hard cap on simultaneous jobs. The webhook returns 429 when saturated so
+    /// GitHub retries instead of letting valid deliveries create unbounded work.
+    pub max_concurrent_jobs: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkerIsolation {
+    /// Backwards-compatible local mode. Production deployments should use
+    /// `Nono` so fork-controlled content crosses a process sandbox boundary.
+    InProcess,
+    Nono {
+        binary: String,
+        profile: String,
+    },
 }
 
 impl ListenerConfig {
@@ -94,6 +110,22 @@ impl ListenerConfig {
         let allowed_owners = parse_csv_lower(&opt("NOGENT_ALLOWED_OWNERS", ""));
         let allowed_installations = parse_csv_u64(&opt("NOGENT_ALLOWED_INSTALLATIONS", ""))
             .map_err(|e| NogentError::Config(format!("NOGENT_ALLOWED_INSTALLATIONS: {e}")))?;
+        let worker_isolation = parse_worker_isolation(
+            &opt("NOGENT_WORKER_MODE", "in-process"),
+            &opt("NOGENT_NONO_BIN", "/usr/bin/nono"),
+            &opt(
+                "NOGENT_NONO_PROFILE",
+                "/usr/share/nogent/nogent-worker.nono.json",
+            ),
+        )?;
+        let max_concurrent_jobs = opt("NOGENT_MAX_CONCURRENT_JOBS", "2")
+            .parse::<usize>()
+            .map_err(|e| NogentError::Config(format!("NOGENT_MAX_CONCURRENT_JOBS invalid: {e}")))?;
+        if !(1..=32).contains(&max_concurrent_jobs) {
+            return Err(NogentError::Config(
+                "NOGENT_MAX_CONCURRENT_JOBS must be between 1 and 32".into(),
+            ));
+        }
 
         Ok(ListenerConfig {
             app_id: req("GITHUB_APP_ID")?,
@@ -109,7 +141,28 @@ impl ListenerConfig {
             max_body_bytes,
             allowed_owners,
             allowed_installations,
+            worker_isolation,
+            max_concurrent_jobs,
         })
+    }
+}
+
+fn parse_worker_isolation(mode: &str, binary: &str, profile: &str) -> Result<WorkerIsolation> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "in-process" => Ok(WorkerIsolation::InProcess),
+        "nono" if binary.trim().is_empty() => Err(NogentError::Config(
+            "NOGENT_NONO_BIN cannot be empty in nono worker mode".into(),
+        )),
+        "nono" if profile.trim().is_empty() => Err(NogentError::Config(
+            "NOGENT_NONO_PROFILE cannot be empty in nono worker mode".into(),
+        )),
+        "nono" => Ok(WorkerIsolation::Nono {
+            binary: binary.to_string(),
+            profile: profile.to_string(),
+        }),
+        other => Err(NogentError::Config(format!(
+            "NOGENT_WORKER_MODE must be 'in-process' or 'nono', got '{other}'"
+        ))),
     }
 }
 
@@ -147,6 +200,8 @@ mod tests {
             max_body_bytes: 0,
             allowed_owners: owners.iter().map(|s| s.to_ascii_lowercase()).collect(),
             allowed_installations: installs.to_vec(),
+            worker_isolation: WorkerIsolation::InProcess,
+            max_concurrent_jobs: 2,
         }
     }
 
@@ -184,5 +239,19 @@ mod tests {
         assert_eq!(parse_csv_lower(" a , B ,  ,c "), vec!["a", "b", "c"]);
         assert_eq!(parse_csv_u64(" 1 , 2,3 ").unwrap(), vec![1, 2, 3]);
         assert!(parse_csv_u64("1,foo").is_err());
+    }
+
+    #[test]
+    fn worker_isolation_is_explicit_and_fail_secure() {
+        assert!(matches!(
+            parse_worker_isolation("in-process", "", ""),
+            Ok(WorkerIsolation::InProcess)
+        ));
+        assert!(matches!(
+            parse_worker_isolation("nono", "/usr/bin/nono", "/etc/nogent/worker.json"),
+            Ok(WorkerIsolation::Nono { .. })
+        ));
+        assert!(parse_worker_isolation("nono", "", "profile").is_err());
+        assert!(parse_worker_isolation("unknown", "nono", "profile").is_err());
     }
 }

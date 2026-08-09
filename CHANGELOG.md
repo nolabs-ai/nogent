@@ -5,6 +5,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Run fork-controlled review and triage jobs in a least-privilege nono worker
+  with phantom GitHub/Gemini credentials and endpoint-limited egress.
+- Bound concurrent workers and return HTTP 429 when saturated so GitHub can
+  retry without causing unbounded process growth.
+
 ## [0.2.3] - 2026-06-30
 
 ### Changed
@@ -83,6 +91,7 @@ Initial release.
 - `--review-local` mode for evaluating the reviewer end-to-end against a
   local checkout (real Gemini, no GitHub).
 
-[Unreleased]: https://github.com/nolabs-ai/nogent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nolabs-ai/nogent/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/nolabs-ai/nogent/compare/v0.2.2...v0.2.3
 [0.2.0]: https://github.com/nolabs-ai/nogent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nolabs-ai/nogent/releases/tag/v0.1.0

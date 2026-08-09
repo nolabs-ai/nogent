@@ -9,6 +9,8 @@ use nogent_core::error::{NogentError, Result, redact_error_body};
 use nogent_core::gemini::{Content, GenerateRequest, GenerateResponse, Part, Tool};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
+use crate::api_base::ApiBase;
+
 const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
 
 /// Accumulated token usage across all calls in one review/triage session.
@@ -32,6 +34,7 @@ struct Usage {
 
 pub struct GeminiClient {
     http: reqwest::Client,
+    api_base: String,
     model: String,
     /// Reasoning level (e.g. "high") for thinking-capable models; None to omit.
     thinking_level: Option<String>,
@@ -40,6 +43,7 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub fn new(api_key: &str, model: &str, thinking_level: Option<&str>) -> Result<Self> {
+        let api_base = ApiBase::from_env("NOGENT_GEMINI_BASE_URL", GEMINI_API)?;
         // Bake the API key into default headers as a *sensitive* value so it
         // doesn't sit in a plain `String` field and so tracing layers can
         // detect and redact it instead of dumping the key into logs.
@@ -55,11 +59,12 @@ impl GeminiClient {
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
-            .https_only(true)
+            .https_only(api_base.requires_https())
             .default_headers(headers)
             .build()?;
         Ok(GeminiClient {
             http,
+            api_base: api_base.url().to_string(),
             model: model.to_string(),
             thinking_level: thinking_level.map(str::to_string),
             usage: Usage::default(),
@@ -79,7 +84,10 @@ impl GeminiClient {
     }
 
     async fn post(&self, req: &GenerateRequest) -> Result<GenerateResponse> {
-        let url = format!("{GEMINI_API}/v1beta/models/{}:generateContent", self.model);
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.api_base, self.model
+        );
         let resp = self.http.post(&url).json(req).send().await?;
         let status = resp.status();
         let body = resp.text().await?;
