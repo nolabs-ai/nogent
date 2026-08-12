@@ -17,12 +17,13 @@ use nogent_core::repo_config::ResolvedConfig;
 
 use crate::app_auth::AppAuth;
 use crate::config::ListenerConfig;
-use crate::{github_mint, review, triage};
+use crate::{github_mint, worker};
 
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<ListenerConfig>,
     pub auth: Arc<AppAuth>,
+    pub worker_slots: Arc<tokio::sync::Semaphore>,
 }
 
 const SIG_HEADER: &str = "x-hub-signature-256";
@@ -58,9 +59,14 @@ pub async fn handle_webhook(
     match event.as_str() {
         "ping" => StatusCode::OK,
         "pull_request" | "issues" | "issue_comment" => {
+            let Ok(worker_slot) = state.worker_slots.clone().try_acquire_owned() else {
+                tracing::warn!(%delivery, %event, "worker capacity exhausted; asking GitHub to retry");
+                return StatusCode::TOO_MANY_REQUESTS;
+            };
             // Detach: token minting + config fetch + model call off the ack path.
             let body = body.to_vec();
             tokio::spawn(async move {
+                let _worker_slot = worker_slot;
                 if let Err(e) = dispatch(&state, &event, &delivery, &body).await {
                     tracing::warn!(%delivery, %event, error = %e, "event dispatch failed");
                 }
@@ -149,7 +155,7 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
         return Ok(());
     };
 
-    review::run(&state.cfg, &token, &job).await?;
+    worker::run(&state.cfg, &token, &job).await?;
     tracing::info!(%delivery, pr = ev.issue.number, "reviewed PR on /nogent review");
     Ok(())
 }
@@ -197,7 +203,7 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
         return Ok(());
     };
 
-    review::run(&state.cfg, &token, &job).await?;
+    worker::run(&state.cfg, &token, &job).await?;
     tracing::info!(%delivery, pr = number, "reviewed PR");
     Ok(())
 }
@@ -247,8 +253,7 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
         config: cfg,
         model: state.cfg.gemini_model.clone(),
     };
-
-    triage::run(&state.cfg, &token, &job).await?;
+    worker::run(&state.cfg, &token, &job).await?;
     tracing::info!(%delivery, issue = issue.number, "triaged issue");
     Ok(())
 }

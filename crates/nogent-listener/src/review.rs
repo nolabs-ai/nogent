@@ -19,7 +19,6 @@ use nogent_core::prompts::pr_review;
 use nogent_core::repo_config::ResolvedConfig;
 use serde_json::{Value, json};
 
-use crate::config::ListenerConfig;
 use crate::gemini_client::GeminiClient;
 use crate::github_client::{GithubClient, InlineComment};
 use crate::repo_index::RepoIndex;
@@ -59,7 +58,12 @@ const MAX_INDEX_BYTES: usize = 50_000_000;
 /// Cap on maintainer guidance (NOGENT.md) folded into the system prompt.
 const GUIDANCE_MAX_BYTES: usize = 16_384;
 
-pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()> {
+pub async fn run(
+    gemini_api_key: &str,
+    thinking_level: Option<&str>,
+    token: &str,
+    job: &EventJob,
+) -> Result<()> {
     let gh = GithubClient::new(token)?;
     let files = gh.list_pr_files(&job.owner, &job.repo, job.number).await?;
     let digest = build_digest(&files, job.config.max_files, job.config.max_patch_bytes);
@@ -104,11 +108,7 @@ pub async fn run(cfg: &ListenerConfig, token: &str, job: &EventJob) -> Result<()
 
     let canary = generate_canary();
     let system = pr_review::system_instruction(&canary, guidance.as_deref());
-    let gemini = GeminiClient::new(
-        &cfg.gemini_api_key,
-        &job.model,
-        cfg.gemini_thinking_level.as_deref(),
-    )?;
+    let gemini = GeminiClient::new(gemini_api_key, &job.model, thinking_level)?;
 
     let mut session = AgentSession::new(&gemini, &system, index.as_ref(), user);
     let review = run_review(&mut session, &canary).await?;

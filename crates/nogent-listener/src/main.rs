@@ -1,9 +1,9 @@
 //! nogent-listener — the GitHub App webhook server.
 //!
-//! Verifies webhook HMAC, mints installation tokens, and runs the PR
-//! security-review / issue-triage in-process: fetch the diff/issue, call Gemini,
-//! validate the canary-gated output, and post the comment.
+//! Verifies webhook HMAC, mints installation tokens, and delegates each PR
+//! security-review / issue-triage job to a nono-sandboxed worker process.
 
+mod api_base;
 mod app_auth;
 mod config;
 mod gemini_client;
@@ -13,6 +13,7 @@ mod repo_index;
 mod review;
 mod triage;
 mod webhook;
+mod worker;
 
 use std::sync::Arc;
 
@@ -39,6 +40,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Local eval mode: review a diff against a local checkout, no GitHub.
     //   GEMINI_API_KEY=... nogent-listener --review-local --repo . --diff change.diff
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--worker") {
+        return worker::run_from_stdin().await;
+    }
     if args.iter().any(|a| a == "--review-local") {
         return review_local(&args).await;
     }
@@ -49,6 +53,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let max_body = cfg.max_body_bytes;
 
     let state = AppState {
+        worker_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_jobs)),
         cfg: Arc::new(cfg),
         auth: Arc::new(auth),
     };

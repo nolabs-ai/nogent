@@ -17,25 +17,38 @@ PRs authored by **bots** (`dependabot`, `renovate`, `github-actions[bot]`, …)
 are skipped by default so a routine bump doesn't burn a review — comment `/nogent review`
 to force one.
 
-
 # Security model and hardening
-The nogent reviewer is **agentic** — it can read files, list directories, and
-call external tools (e.g., `grep`) to navigate the repo and understand the diff. This
-is powerful, but it also means that **prompt injection** is a real risk: a malicious
-PR could try to trick the model into revealing secrets or taking unsafe actions. 
+
+The nogent reviewer is **agentic** — the model can call bounded in-memory tools
+to navigate a repository snapshot and understand the diff. This is powerful,
+but it also means that **prompt injection** is a real risk: a malicious PR could
+try to steer the model into unsafe actions.
 
 To mitigate this, nogent implements several layers of defense:
 
 - **HMAC verification** of every webhook against the raw body, constant-time.
 - **Canary-gated output** — the model must echo a per-run random canary inside a
-  strict JSON schema; any response that omits/alters it or adds keys is discarded
-  and replaced by a fixed "manual review" comment. This is the prompt-injection
-  backstop.
+  bounded JSON structure; any response that omits/alters the canary or violates
+  the required shape is discarded and replaced by a fixed "manual review"
+  comment. This limits the effect of prompt injection on posted output.
 - **Least-privilege App permissions** (`contents:read`, `issues:write`,
   `pull_requests:write`, `metadata:read`).
 - **Bounded diffs** (`maxFiles`/`maxPatchBytes`) and **fail-secure config**.
 - **Bot-PR skip** — automated PRs from dependabot/renovate/etc. are ignored by
   default; a human comment is required to opt them in.
+- **nono worker boundary** — fork-controlled tarballs, diffs, prompts, and model
+  tool calls are processed in a separate nono-sandboxed process. The trusted
+  listener keeps the App private key and webhook secret.
+- **Phantom credentials** — nono's credential proxy keeps the real
+  repository-scoped GitHub token and Gemini key out of the worker. The child
+  receives one random 256-bit session token that is valid only at its loopback
+  proxy.
+- **Endpoint-limited egress** — the worker can call only the GitHub read/comment
+  endpoints required for its target repository, Gemini generation, and
+  GitHub's tarball host. It has no filesystem write capability or working
+  directory access.
+- **Bounded workers** — valid webhook bursts receive HTTP 429 once the worker
+  pool is full, allowing GitHub to retry without creating unbounded processes.
 
 In addition to the app-layer defenses above, the published image is signed and verified,
 and the runtime is hardened:
@@ -43,6 +56,8 @@ and the runtime is hardened:
 **Container image** (`ghcr.io/nolabs-ai/nogent:vX.Y.Z`):
 - Built from Chainguard's **distroless `glibc-dynamic`** — no shell, no package
   manager, no busybox in the runtime layer.
+- Includes a checksum-pinned nono binary and enables sandboxed worker mode by
+  default.
 - Runs as **non-root** (uid `65532`).
 - TLS via **rustls + ring**, with Mozilla roots baked into the binary
   (`webpki-roots`); no host CA trust, no OpenSSL in the runtime.
@@ -72,7 +87,7 @@ Two layers, for two audiences:
 | Crate | Role |
 |-------|------|
 | `nogent-core` | Shared, transport-light logic: webhook event types, repo config (fail-secure), prompts, canary output validator, diff bounding, HMAC verify. |
-| `nogent-listener` | The app (axum). HMAC verify, App JWT + installation-token mint/cache, and the in-process GitHub + Gemini clients + review/triage orchestration. |
+| `nogent-listener` | Trusted webhook listener + per-job nono worker entrypoint. The listener verifies HMAC and mints scoped tokens; the worker handles untrusted review/triage content through phantom credentials. |
 
 ## Evaluate the reviewer locally
 

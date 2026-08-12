@@ -1,9 +1,10 @@
 # systemd unit for the nogent listener.
 #
-# The listener holds the real secrets and does the PR review / issue triage
-# in-process. This unit hardens it.
+# The listener holds the real App secrets. PR review / issue triage runs in a
+# nono-sandboxed child with phantom GitHub/Gemini credentials.
 #
 # Install: /etc/systemd/system/nogent-listener.service
+# Profile: /etc/nogent/nogent-worker.nono.json (copy from deploy/)
 # Secrets: /etc/nogent/nogent.env (mode 0600, owned by the service user),
 #          ideally rendered at boot from AWS Secrets Manager.
 
@@ -17,6 +18,13 @@ Type=simple
 User=nogent
 Group=nogent
 EnvironmentFile=/etc/nogent/nogent.env
+Environment=NOGENT_WORKER_MODE=nono
+Environment=NOGENT_NONO_BIN=/usr/bin/nono
+Environment=NOGENT_NONO_PROFILE=/etc/nogent/nogent-worker.nono.json
+Environment=HOME=/var/lib/nogent
+Environment=XDG_STATE_HOME=/var/lib/nogent
+StateDirectory=nogent
+ExecStartPre=/usr/bin/nono profile validate /etc/nogent/nogent-worker.nono.json
 ExecStart=/usr/local/bin/nogent-listener
 Restart=on-failure
 RestartSec=2
@@ -29,6 +37,8 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+MemoryMax=1G
+TasksMax=128
 
 [Install]
 WantedBy=multi-user.target

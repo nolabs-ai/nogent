@@ -9,8 +9,9 @@ setup (sections 1–4); pick **A (Terraform)** or **B (manual)** for the host.
 - **B — Manual**: the same thing by hand on an instance you already have.
 
 Either way the runtime shape is: **Caddy** terminates TLS and reverse-proxies to
-the **listener** on `127.0.0.1:8080`; the listener does the review/triage
-in-process. See the README for the security rationale.
+the trusted **listener** on `127.0.0.1:8080`; each review/triage job runs in a
+separate nono-sandboxed worker with proxy-injected phantom credentials. See the
+README for the security rationale.
 
 ---
 
@@ -33,7 +34,9 @@ nogent ships as a container image. CI builds it on each `v*` tag and pushes to
 keyless cosign signature — see [`docker/`](docker/) and
 `.github/workflows/image.yml`. The image is built on Chainguard's Rust image and
 runs on distroless `glibc-dynamic` (nonroot, no shell); CA roots are baked into
-the binary, so it needs no `ca-certificates` layer.
+the binary, so it needs no `ca-certificates` layer. The image includes
+checksum-pinned nono `0.72.0`; workers have read-only filesystem capabilities
+and endpoint-limited GitHub/Gemini egress.
 
 Tag a release to publish:
 
@@ -122,6 +125,10 @@ The listener reads these (see [`.env.example`](.env.example)):
 | `NOGENT_BIND_ADDR` | no | default `127.0.0.1:8080` |
 | `NOGENT_MAX_BODY_BYTES` | no | webhook body cap, default 2 MiB |
 | `NOGENT_PROMPTS_DIR` | no | dir of Markdown system prompts to use instead of the embedded ones (see `crates/nogent-core/prompts/`) |
+| `NOGENT_MAX_CONCURRENT_JOBS` | no | simultaneous review/triage cap, default 2; saturation returns 429 for GitHub retry |
+| `NOGENT_WORKER_MODE` | no | `nono` or `in-process`; the published image defaults to `nono` |
+| `NOGENT_NONO_BIN` | no | nono executable, default `/usr/bin/nono` |
+| `NOGENT_NONO_PROFILE` | no | worker profile; image default is `/usr/share/nogent/nogent-worker.nono.json` |
 
 For AWS, store the three secrets as a **Secrets Manager JSON** with these keys
 (this is exactly what the Terraform user-data expects):
@@ -212,8 +219,9 @@ notes.
 5. **Webhook URL:** set it to `https://<your-domain>/api/github/webhooks`.
 
 > The pre-container systemd path (`deploy/nogent-listener.service` +
-> `deploy/Caddyfile`, running the raw binary) still works if you prefer no
-> container runtime; it's kept as an alternative.
+> `deploy/Caddyfile`) also uses sandboxed workers. Install nono plus
+> `deploy/nogent-worker.nono.json` at
+> `/etc/nogent/nogent-worker.nono.json` before starting the unit.
 
 ---
 
@@ -232,9 +240,9 @@ The listener never binds a public port — Caddy is the only public listener.
 
 - Pinning ingress 443 to GitHub's `hooks` CIDRs is stronger but those ranges
   change; `0.0.0.0/0` is fine because the **HMAC check is the real gate**.
-- Restricting egress to GitHub + Gemini (+ Secrets Manager/ACME) limits where a
-  compromised process can reach — worth doing since the listener holds real
-  credentials.
+- Restricting host egress to GitHub + Gemini (+ Secrets Manager/ACME) remains
+  worthwhile. The nono worker separately enforces a narrower per-process
+  allowlist and never receives the real API credentials.
 
 ---
 
@@ -297,10 +305,15 @@ reviewer's instructions.
 
 ## 9. Caveats
 
-- The listener holds the real installation token + Gemini key in memory while
-  processing untrusted content; there is no sandbox boundary in this version.
-  Restrict egress (section 5), keep the host minimal, and treat re-introducing
-  the nono sandbox as the next hardening step.
+- The trusted listener still parses signed webhook metadata and holds App
+  credentials. The sandbox boundary begins before fork-controlled repository
+  archives and model prompts are processed. nono contains capabilities; it does
+  not decide whether model text is semantically malicious, so canary/schema
+  validation remains required.
+- A compromised worker can consume Gemini quota and exercise its explicitly
+  allowed operations against the one repository covered by its short-lived
+  installation token. It cannot read the real token/key or open arbitrary
+  network destinations.
 - nogent fetches only the first 100 changed files of very large PRs and bounds
   the diff to `maxFiles`/`maxPatchBytes`; truncation is logged and marked in the
   prompt.

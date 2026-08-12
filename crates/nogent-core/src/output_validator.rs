@@ -14,7 +14,13 @@ use serde::Deserialize;
 pub const FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming security review for this change \
 (the model output failed canary/shape validation). A maintainer should review manually.";
 
+/// Posted when issue-triage output fails validation.
+pub const ISSUE_TRIAGE_FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming triage analysis for this issue \
+(the model output failed canary/shape validation). A maintainer should review manually.";
+
 pub const ISSUE_TRIAGE_MARKER: &str = "<!-- nogent:issue-triage -->";
+
+pub const ISSUE_TRIAGE_FOOTER: &str = "Thanks for raising this issue, our maintainers often have a large amount of issues to work through. To help us resolve this for you more quickly, jump onto our discord, post the link and help us get more context and figure out a solution: https://discord.gg/G6qDa7cC7x";
 
 const MAX_ITEMS: usize = 30;
 const MAX_FINDING_DESC: usize = 1_500;
@@ -424,7 +430,15 @@ pub fn format_issue_triage_markdown(out: &IssueTriageOutput) -> String {
         ));
     }
     s.push_str("<sub>Automated triage suggestion. Not a maintainer decision.</sub>");
+    s.push_str("\n\n");
+    s.push_str(ISSUE_TRIAGE_FOOTER);
     s
+}
+
+/// Render the fixed fallback used when model output fails validation.
+#[must_use]
+pub fn format_issue_triage_fallback_markdown() -> String {
+    format!("{ISSUE_TRIAGE_MARKER}\n\n{ISSUE_TRIAGE_FALLBACK_MESSAGE}\n\n{ISSUE_TRIAGE_FOOTER}")
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -634,5 +648,21 @@ mod tests {
     fn issue_triage_valid_passes() {
         let raw = r#"{"canary":"c","verdict":"config","suggested_resolution_path":".github/nogent.json","maintainer_notes":""}"#;
         assert!(validate_issue_triage(raw, "c").is_some());
+    }
+
+    #[test]
+    fn issue_triage_bodies_end_with_support_footer() {
+        let out = IssueTriageOutput {
+            canary: "c".into(),
+            verdict: "needs-more-info".into(),
+            suggested_resolution_path: "Ask the reporter for logs.".into(),
+            maintainer_notes: String::new(),
+        };
+
+        assert!(format_issue_triage_markdown(&out).ends_with(ISSUE_TRIAGE_FOOTER));
+        let fallback = format_issue_triage_fallback_markdown();
+        assert!(fallback.contains(ISSUE_TRIAGE_FALLBACK_MESSAGE));
+        assert!(!fallback.contains(FALLBACK_MESSAGE));
+        assert!(fallback.ends_with(ISSUE_TRIAGE_FOOTER));
     }
 }

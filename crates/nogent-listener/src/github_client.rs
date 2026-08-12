@@ -12,6 +12,8 @@ use reqwest::header::{ACCEPT as ACCEPT_HEADER, AUTHORIZATION, HeaderMap, HeaderN
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::api_base::ApiBase;
+
 /// An inline review comment anchored to a line of the diff (new side).
 #[derive(Debug, Clone, Serialize)]
 pub struct InlineComment {
@@ -49,10 +51,12 @@ fn urlencode_segment(seg: &str) -> String {
 
 pub struct GithubClient {
     http: reqwest::Client,
+    api_base: String,
 }
 
 impl GithubClient {
     pub fn new(token: &str) -> Result<Self> {
+        let api_base = ApiBase::from_env("NOGENT_GITHUB_BASE_URL", GITHUB_API)?;
         // Bake Authorization + X-GitHub-Api-Version into default headers so the
         // token bytes don't sit in a plain `String` field for the client's
         // lifetime, and so the bearer is marked sensitive (tracing layers like
@@ -77,14 +81,17 @@ impl GithubClient {
             // tarball endpoint legitimately 302s to codeload.github.com.
             .redirect(reqwest::redirect::Policy::limited(3))
             // Refuse any plaintext leg even via redirect.
-            .https_only(true)
+            .https_only(api_base.requires_https())
             .default_headers(headers)
             .build()?;
-        Ok(GithubClient { http })
+        Ok(GithubClient {
+            http,
+            api_base: api_base.url().to_string(),
+        })
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{GITHUB_API}{path}")
+        format!("{}{path}", self.api_base)
     }
 
     /// List a PR's changed files (first page, up to 100). Logs if more exist.
@@ -131,7 +138,9 @@ impl GithubClient {
             .map(urlencode_segment)
             .collect::<Vec<_>>()
             .join("/");
-        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{enc_path}?ref={git_ref}");
+        let url = self.url(&format!(
+            "/repos/{owner}/{repo}/contents/{enc_path}?ref={git_ref}"
+        ));
         let resp = self
             .http
             .get(&url)
@@ -222,7 +231,7 @@ impl GithubClient {
         git_ref: &str,
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/tarball/{git_ref}");
+        let url = self.url(&format!("/repos/{owner}/{repo}/tarball/{git_ref}"));
         let resp = self
             .http
             .get(&url)
