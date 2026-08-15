@@ -4,6 +4,8 @@
 //! key) in `Zeroizing` memory and never logs them.
 
 use std::env;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use nogent_core::error::{NogentError, Result};
 use zeroize::Zeroizing;
@@ -29,9 +31,15 @@ pub struct ListenerConfig {
     pub allowed_installations: Vec<u64>,
     /// How untrusted review and triage jobs are executed.
     pub worker_isolation: WorkerIsolation,
-    /// Hard cap on simultaneous jobs. The webhook returns 429 when saturated so
-    /// GitHub retries instead of letting valid deliveries create unbounded work.
+    /// Hard cap on simultaneous review/triage workers.
     pub max_concurrent_jobs: usize,
+    /// Number of actionable, verified deliveries that can wait in memory for a
+    /// worker. A delivery is acknowledged only after it enters this queue.
+    pub max_queued_jobs: usize,
+    /// Overall deadline for one review/triage job, including the nono process.
+    pub worker_timeout: Duration,
+    /// Optional operator-owned prompt directory, canonicalized at startup.
+    pub prompts_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,8 +48,8 @@ pub enum WorkerIsolation {
     /// `Nono` so fork-controlled content crosses a process sandbox boundary.
     InProcess,
     Nono {
-        binary: String,
-        profile: String,
+        binary: PathBuf,
+        profile: PathBuf,
     },
 }
 
@@ -126,6 +134,23 @@ impl ListenerConfig {
                 "NOGENT_MAX_CONCURRENT_JOBS must be between 1 and 32".into(),
             ));
         }
+        let max_queued_jobs = opt("NOGENT_MAX_QUEUED_JOBS", "100")
+            .parse::<usize>()
+            .map_err(|e| NogentError::Config(format!("NOGENT_MAX_QUEUED_JOBS invalid: {e}")))?;
+        if !(1..=10_000).contains(&max_queued_jobs) {
+            return Err(NogentError::Config(
+                "NOGENT_MAX_QUEUED_JOBS must be between 1 and 10000".into(),
+            ));
+        }
+        let worker_timeout_secs = opt("NOGENT_WORKER_TIMEOUT_SECS", "900")
+            .parse::<u64>()
+            .map_err(|e| NogentError::Config(format!("NOGENT_WORKER_TIMEOUT_SECS invalid: {e}")))?;
+        if !(30..=3_600).contains(&worker_timeout_secs) {
+            return Err(NogentError::Config(
+                "NOGENT_WORKER_TIMEOUT_SECS must be between 30 and 3600".into(),
+            ));
+        }
+        let prompts_dir = load_prompts_dir()?;
 
         Ok(ListenerConfig {
             app_id: req("GITHUB_APP_ID")?,
@@ -143,6 +168,9 @@ impl ListenerConfig {
             allowed_installations,
             worker_isolation,
             max_concurrent_jobs,
+            max_queued_jobs,
+            worker_timeout: Duration::from_secs(worker_timeout_secs),
+            prompts_dir,
         })
     }
 }
@@ -157,13 +185,54 @@ fn parse_worker_isolation(mode: &str, binary: &str, profile: &str) -> Result<Wor
             "NOGENT_NONO_PROFILE cannot be empty in nono worker mode".into(),
         )),
         "nono" => Ok(WorkerIsolation::Nono {
-            binary: binary.to_string(),
-            profile: profile.to_string(),
+            binary: PathBuf::from(binary.trim()),
+            profile: PathBuf::from(profile.trim()),
         }),
         other => Err(NogentError::Config(format!(
             "NOGENT_WORKER_MODE must be 'in-process' or 'nono', got '{other}'"
         ))),
     }
+}
+
+fn load_prompts_dir() -> Result<Option<PathBuf>> {
+    let Ok(raw) = env::var("NOGENT_PROMPTS_DIR") else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let dir = std::fs::canonicalize(raw.trim())
+        .map_err(|e| NogentError::Config(format!("canonicalizing NOGENT_PROMPTS_DIR: {e}")))?;
+    if !dir.is_dir() {
+        return Err(NogentError::Config(
+            "NOGENT_PROMPTS_DIR must name a directory".into(),
+        ));
+    }
+    let protected_files = [
+        PathBuf::from("/etc/nogent/app-private-key.pem"),
+        PathBuf::from("/etc/nogent/nogent.env"),
+        PathBuf::from("/private/etc/nogent/app-private-key.pem"),
+        PathBuf::from("/private/etc/nogent/nogent.env"),
+    ];
+    if protected_files
+        .iter()
+        .any(|secret| secret.starts_with(&dir))
+    {
+        return Err(NogentError::Config(
+            "NOGENT_PROMPTS_DIR must not contain listener secret files".into(),
+        ));
+    }
+    for file in [
+        nogent_core::prompts::PR_REVIEW_SYSTEM_FILE,
+        nogent_core::prompts::ISSUE_TRIAGE_SYSTEM_FILE,
+    ] {
+        std::fs::read_to_string(dir.join(file)).map_err(|e| {
+            NogentError::Config(format!(
+                "reading NOGENT_PROMPTS_DIR/{file} during startup validation: {e}"
+            ))
+        })?;
+    }
+    Ok(Some(dir))
 }
 
 fn parse_csv_lower(raw: &str) -> Vec<String> {
@@ -202,6 +271,9 @@ mod tests {
             allowed_installations: installs.to_vec(),
             worker_isolation: WorkerIsolation::InProcess,
             max_concurrent_jobs: 2,
+            max_queued_jobs: 100,
+            worker_timeout: Duration::from_secs(900),
+            prompts_dir: None,
         }
     }
 

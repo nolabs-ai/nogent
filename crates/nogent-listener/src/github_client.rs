@@ -1,7 +1,6 @@
-//! GitHub API access using an installation token, direct to `api.github.com`.
-//!
-//! (Without nono there is no proxy/phantom indirection; the listener holds the
-//! real token and calls GitHub directly.)
+//! GitHub API access using an installation token. Trusted listener callers use
+//! `api.github.com` directly; sandbox workers receive an explicit validated
+//! nono loopback base URL.
 
 use std::time::Duration;
 
@@ -56,14 +55,22 @@ pub struct GithubClient {
 
 impl GithubClient {
     pub fn new(token: &str) -> Result<Self> {
-        let api_base = ApiBase::from_env("NOGENT_GITHUB_BASE_URL", GITHUB_API)?;
+        Self::with_base(token, ApiBase::direct("GitHub API", GITHUB_API)?)
+    }
+
+    pub fn new_for_worker(token: &str, api_base: &ApiBase) -> Result<Self> {
+        Self::with_base(token, api_base.clone())
+    }
+
+    fn with_base(token: &str, api_base: ApiBase) -> Result<Self> {
         // Bake Authorization + X-GitHub-Api-Version into default headers so the
         // token bytes don't sit in a plain `String` field for the client's
         // lifetime, and so the bearer is marked sensitive (tracing layers like
         // tower_http will print `Sensitive` instead of the value).
-        let mut auth = HeaderValue::from_str(&format!("token {token}"))
-            .map_err(|e| NogentError::Auth(format!("token is not a valid header value: {e}")))?;
-        auth.set_sensitive(true);
+        // nono's reverse proxy accepts the phantom as Bearer (or bare), then
+        // replaces it with the route's real upstream credential format.
+        // GitHub also accepts Bearer for direct installation-token requests.
+        let auth = authorization_header(token)?;
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, auth);
         headers.insert(
@@ -77,10 +84,10 @@ impl GithubClient {
             // webhook spawn indefinitely.
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(5))
-            // Cap redirect chains. We can't use Policy::none() because the
-            // tarball endpoint legitimately 302s to codeload.github.com.
-            .redirect(reqwest::redirect::Policy::limited(3))
-            // Refuse any plaintext leg even via redirect.
+            // The worker's first leg is HTTP loopback, so https_only(false) is
+            // necessary there. The custom policy still rejects every
+            // plaintext redirect; GitHub's tarball redirect is HTTPS.
+            .redirect(https_redirect_policy())
             .https_only(api_base.requires_https())
             .default_headers(headers)
             .build()?;
@@ -92,6 +99,25 @@ impl GithubClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.api_base)
+    }
+
+    /// Startup probe for nono reverse-proxy authentication. The path is
+    /// intentionally absent from the endpoint allowlist: 403 proves the
+    /// phantom was accepted before policy blocked the request; 401 catches an
+    /// incompatible auth scheme. No request reaches GitHub upstream.
+    pub async fn verify_worker_proxy_auth(&self) -> Result<()> {
+        let response = self
+            .http
+            .get(self.url("/nogent-auth-preflight"))
+            .send()
+            .await?;
+        if response.status() != reqwest::StatusCode::FORBIDDEN {
+            return Err(NogentError::Auth(format!(
+                "GitHub worker proxy auth preflight expected 403, got {}",
+                response.status().as_u16()
+            )));
+        }
+        Ok(())
     }
 
     /// List a PR's changed files (first page, up to 100). Logs if more exist.
@@ -396,5 +422,51 @@ impl GithubClient {
             });
         }
         Ok(())
+    }
+}
+
+fn https_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 3 {
+            attempt.error("too many redirects")
+        } else if is_secure_redirect(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("redirect to a non-HTTPS URL blocked")
+        }
+    })
+}
+
+fn authorization_header(token: &str) -> Result<HeaderValue> {
+    let mut auth = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+        NogentError::Auth(format!("token is not a valid header value: {error}"))
+    })?;
+    auth.set_sensitive(true);
+    Ok(auth)
+}
+
+fn is_secure_redirect(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_auth_uses_nono_compatible_bearer_scheme() {
+        let header = authorization_header("phantom").expect("header");
+        assert_eq!(header.to_str().expect("text"), "Bearer phantom");
+        assert!(header.is_sensitive());
+    }
+
+    #[test]
+    fn redirects_must_remain_https() {
+        assert!(is_secure_redirect(
+            &reqwest::Url::parse("https://codeload.github.com/o/r").expect("https")
+        ));
+        assert!(!is_secure_redirect(
+            &reqwest::Url::parse("http://codeload.github.com/o/r").expect("http")
+        ));
     }
 }

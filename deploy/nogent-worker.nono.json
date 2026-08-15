@@ -27,13 +27,11 @@
     "access": "none"
   },
   "filesystem": {
-    "read_file": [
-      "/usr/bin/nogent-listener",
-      "/usr/local/bin/nogent-listener"
-    ],
     "deny": [
-      "/etc/nogent",
-      "/private/etc/nogent"
+      "/etc/nogent/app-private-key.pem",
+      "/etc/nogent/nogent.env",
+      "/private/etc/nogent/app-private-key.pem",
+      "/private/etc/nogent/nogent.env"
     ]
   },
   "network": {
@@ -50,7 +48,7 @@
         "credential_key": "env://GITHUB_TOKEN",
         "env_var": "GITHUB_TOKEN",
         "inject_header": "Authorization",
-        "credential_format": "token {}",
+        "credential_format": "Bearer {}",
         "endpoint_rules": [
           { "method": "GET", "path": "/repos/*/*/pulls/*" },
           { "method": "GET", "path": "/repos/*/*/pulls/*/files" },
@@ -83,11 +81,9 @@
       "RUST_LOG",
       "RUST_BACKTRACE",
       "GEMINI_THINKING_LEVEL",
-      "GITHUB_TOKEN",
-      "GEMINI_API_KEY",
       "NOGENT_GITHUB_BASE_URL",
       "NOGENT_GEMINI_BASE_URL",
-      "NOGENT_REQUIRE_PHANTOM_CREDENTIALS",
+      "NOGENT_PROMPTS_DIR",
       "HTTP_PROXY",
       "HTTPS_PROXY",
       "NO_PROXY",

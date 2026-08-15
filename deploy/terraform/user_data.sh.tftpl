@@ -20,6 +20,15 @@ dnf install -y docker jq chrony
 systemctl enable --now chronyd
 systemctl enable --now docker
 
+# nono's Linux sandbox requires Landlock to be active in the host kernel. Fail
+# bootstrap before pulling or starting nogent if the LSM is absent; otherwise
+# the listener would repeatedly fail its worker preflight only after launch.
+if [ ! -r /sys/kernel/security/lsm ] || \
+   ! tr ',' '\n' < /sys/kernel/security/lsm | grep -qx landlock; then
+  echo "Landlock is not active in the kernel LSM list; refusing to deploy nogent" >&2
+  exit 1
+fi
+
 # compose v2 plugin — pinned version, checksum-verified against the per-asset
 # `.sha256` sidecar published in the same release (more robust than parsing a
 # multi-asset `checksums.txt`: the sidecar contains exactly one line for the

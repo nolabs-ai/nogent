@@ -125,7 +125,9 @@ The listener reads these (see [`.env.example`](.env.example)):
 | `NOGENT_BIND_ADDR` | no | default `127.0.0.1:8080` |
 | `NOGENT_MAX_BODY_BYTES` | no | webhook body cap, default 2 MiB |
 | `NOGENT_PROMPTS_DIR` | no | dir of Markdown system prompts to use instead of the embedded ones (see `crates/nogent-core/prompts/`) |
-| `NOGENT_MAX_CONCURRENT_JOBS` | no | simultaneous review/triage cap, default 2; saturation returns 429 for GitHub retry |
+| `NOGENT_MAX_CONCURRENT_JOBS` | no | simultaneous review/triage worker cap, default 2 |
+| `NOGENT_MAX_QUEUED_JOBS` | no | actionable deliveries waiting for a worker, default 100 |
+| `NOGENT_WORKER_TIMEOUT_SECS` | no | overall deadline for a review/triage worker, default 900 seconds |
 | `NOGENT_WORKER_MODE` | no | `nono` or `in-process`; the published image defaults to `nono` |
 | `NOGENT_NONO_BIN` | no | nono executable, default `/usr/bin/nono` |
 | `NOGENT_NONO_PROFILE` | no | worker profile; image default is `/usr/share/nogent/nogent-worker.nono.json` |
@@ -314,6 +316,9 @@ reviewer's instructions.
   allowed operations against the one repository covered by its short-lived
   installation token. It cannot read the real token/key or open arbitrary
   network destinations.
+- The delivery queue is bounded but in-memory. GitHub does not automatically
+  redeliver a delivery that receives HTTP 503, so monitor the App's failed
+  deliveries and redeliver them manually or with a scheduled recovery job.
 - nogent fetches only the first 100 changed files of very large PRs and bounds
   the diff to `maxFiles`/`maxPatchBytes`; truncation is logged and marked in the
   prompt.

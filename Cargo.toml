@@ -13,7 +13,7 @@ repository = "https://github.com/nolabs-ai/nogent"
 
 [workspace.dependencies]
 # Async runtime. The listener also uses tokio::process to spawn `nono run`.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "net", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "net", "io-util", "fs", "sync", "time"] }
 # Webhook HTTP server (matches nono-gateway's framework choice).
 axum = { version = "0.7", features = ["macros"] }
 # Request tracing + a hard body-size limit on the webhook endpoint.

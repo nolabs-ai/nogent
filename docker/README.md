@@ -64,8 +64,10 @@ mount a directory and point `NOGENT_PROMPTS_DIR` at it (see
 The production profile is
 [`../deploy/nogent-worker.nono.json`](../deploy/nogent-worker.nono.json). It
 permits only GitHub's required repository endpoints, Gemini generation, and
-`codeload.github.com`; the worker receives no filesystem write grant. Validate
-changes with:
+`codeload.github.com`; the worker receives no filesystem write grant. At
+listener startup, nogent launches a real sandbox child and refuses to bind the
+webhook port if the profile, executable grant, phantom credentials, or proxy
+URLs are broken. Validate profile changes with:
 
 ```bash
 nono profile validate deploy/nogent-worker.nono.json

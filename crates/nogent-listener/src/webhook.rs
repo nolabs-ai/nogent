@@ -1,9 +1,8 @@
-//! Webhook receiver: verify, parse, dispatch.
+//! Webhook receiver: verify, filter, enqueue, and dispatch.
 //!
-//! The hot path is intentionally short: verify the HMAC, identify the event,
-//! then hand off to a detached task and fast-ack. GitHub expects a response
-//! within ~10s; minting tokens and running the model happen off the response
-//! path.
+//! The HTTP path verifies HMAC and performs payload-only filtering before
+//! placing an actionable delivery on a bounded in-memory queue. Queue workers
+//! perform token minting, config fetches, and model calls after the 202 reply.
 
 use std::sync::Arc;
 
@@ -11,9 +10,12 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use nogent_core::error::Result;
-use nogent_core::events::{self, EventJob, IssueEvent, JobKind, PullRequestEvent};
+use nogent_core::events::{
+    self, EventJob, IssueCommentEvent, IssueEvent, JobKind, PullRequestEvent,
+};
 use nogent_core::hmac_verify::verify_signature;
 use nogent_core::repo_config::ResolvedConfig;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::app_auth::AppAuth;
 use crate::config::ListenerConfig;
@@ -23,12 +25,49 @@ use crate::{github_mint, worker};
 pub struct AppState {
     pub cfg: Arc<ListenerConfig>,
     pub auth: Arc<AppAuth>,
-    pub worker_slots: Arc<tokio::sync::Semaphore>,
+    pub job_tx: mpsc::Sender<QueuedDelivery>,
+}
+
+pub struct QueuedDelivery {
+    delivery: String,
+    event: QueuedEvent,
+}
+
+enum QueuedEvent {
+    Pr(PullRequestEvent),
+    Issue(IssueEvent),
+    Command(IssueCommentEvent),
 }
 
 const SIG_HEADER: &str = "x-hub-signature-256";
 const EVENT_HEADER: &str = "x-github-event";
 const DELIVERY_HEADER: &str = "x-github-delivery";
+
+/// Start the bounded-concurrency queue consumer. The receiver deliberately
+/// waits for a worker slot before taking the next queued item, so queue
+/// capacity accurately represents outstanding work waiting to start.
+pub fn start_dispatcher(
+    state: AppState,
+    mut jobs: mpsc::Receiver<QueuedDelivery>,
+) -> tokio::task::JoinHandle<()> {
+    let worker_slots = Arc::new(Semaphore::new(state.cfg.max_concurrent_jobs));
+    tokio::spawn(async move {
+        while let Some(queued) = jobs.recv().await {
+            let Ok(worker_slot) = worker_slots.clone().acquire_owned().await else {
+                tracing::error!("worker semaphore closed; stopping webhook dispatcher");
+                return;
+            };
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _worker_slot = worker_slot;
+                let delivery = queued.delivery.clone();
+                if let Err(error) = dispatch(&state, queued).await {
+                    tracing::warn!(%delivery, %error, "event dispatch failed");
+                }
+            });
+        }
+    })
+}
 
 /// POST /api/github/webhooks
 pub async fn handle_webhook(
@@ -36,8 +75,9 @@ pub async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // 1. Verify signature over the RAW body.
-    let sig = headers.get(SIG_HEADER).and_then(|v| v.to_str().ok());
+    let sig = headers
+        .get(SIG_HEADER)
+        .and_then(|value| value.to_str().ok());
     let Some(sig) = sig else {
         return StatusCode::UNAUTHORIZED;
     };
@@ -47,45 +87,157 @@ pub async fn handle_webhook(
 
     let event = headers
         .get(EVENT_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
     let delivery = headers
         .get(DELIVERY_HEADER)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
 
-    match event.as_str() {
-        "ping" => StatusCode::OK,
-        "pull_request" | "issues" | "issue_comment" => {
-            let Ok(worker_slot) = state.worker_slots.clone().try_acquire_owned() else {
-                tracing::warn!(%delivery, %event, "worker capacity exhausted; asking GitHub to retry");
-                return StatusCode::TOO_MANY_REQUESTS;
-            };
-            // Detach: token minting + config fetch + model call off the ack path.
-            let body = body.to_vec();
-            tokio::spawn(async move {
-                let _worker_slot = worker_slot;
-                if let Err(e) = dispatch(&state, &event, &delivery, &body).await {
-                    tracing::warn!(%delivery, %event, error = %e, "event dispatch failed");
-                }
-            });
-            StatusCode::ACCEPTED
+    if event == "ping" {
+        return StatusCode::OK;
+    }
+    if !matches!(event, "pull_request" | "issues" | "issue_comment") {
+        tracing::debug!(%delivery, %event, "ignoring unsubscribed event");
+        return StatusCode::NO_CONTENT;
+    }
+
+    let queued = match classify_delivery(&state.cfg, event, &delivery, &body) {
+        Ok(Some(queued)) => queued,
+        Ok(None) => return StatusCode::NO_CONTENT,
+        Err(error) => {
+            tracing::warn!(%delivery, %event, %error, "invalid signed webhook payload");
+            return StatusCode::BAD_REQUEST;
         }
-        other => {
-            tracing::debug!(%delivery, event = other, "ignoring unsubscribed event");
-            StatusCode::NO_CONTENT
+    };
+
+    match state.job_tx.try_send(queued) {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // GitHub does not automatically retry failed webhook deliveries.
+            // A 503 makes the failure visible in delivery history; operators
+            // must manually redeliver it (or run an automated redelivery job).
+            tracing::error!(
+                %delivery,
+                %event,
+                "job queue is full; delivery was not accepted and must be redelivered"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::error!(%delivery, %event, "job dispatcher is unavailable");
+            StatusCode::SERVICE_UNAVAILABLE
         }
     }
 }
 
-async fn dispatch(state: &AppState, event: &str, delivery: &str, body: &[u8]) -> Result<()> {
-    match event {
-        "pull_request" => dispatch_pr(state, delivery, body).await,
-        "issues" => dispatch_issue(state, delivery, body).await,
-        "issue_comment" => dispatch_command(state, delivery, body).await,
-        _ => Ok(()),
+fn classify_delivery(
+    cfg: &ListenerConfig,
+    event: &str,
+    delivery: &str,
+    body: &[u8],
+) -> Result<Option<QueuedDelivery>> {
+    let event = match event {
+        "pull_request" => {
+            let ev: PullRequestEvent = serde_json::from_slice(body).map_err(|error| {
+                nogent_core::NogentError::Payload(format!("pull_request: {error}"))
+            })?;
+            if !events::is_actionable_pr_action(&ev.action) || ev.pull_request.draft {
+                tracing::debug!(
+                    %delivery,
+                    action = %ev.action,
+                    draft = ev.pull_request.draft,
+                    "skipping PR"
+                );
+                return Ok(None);
+            }
+            if ev.pull_request.user.is_bot() {
+                tracing::info!(
+                    %delivery,
+                    author = %ev.pull_request.user.login,
+                    "skipping bot-authored PR"
+                );
+                return Ok(None);
+            }
+            let Some((owner, _)) = ev.repository.owner_repo() else {
+                tracing::warn!(
+                    %delivery,
+                    full_name = %ev.repository.full_name,
+                    "bad repo full_name"
+                );
+                return Ok(None);
+            };
+            if !cfg.allowlist_permits(ev.installation.id, owner) {
+                tracing::info!(
+                    %delivery,
+                    %owner,
+                    installation = ev.installation.id,
+                    "blocked by allowlist"
+                );
+                return Ok(None);
+            }
+            QueuedEvent::Pr(ev)
+        }
+        "issues" => {
+            let ev: IssueEvent = serde_json::from_slice(body)
+                .map_err(|error| nogent_core::NogentError::Payload(format!("issues: {error}")))?;
+            if ev.issue.pull_request.is_some() || !events::is_actionable_issue_action(&ev.action) {
+                return Ok(None);
+            }
+            let Some((owner, _)) = ev.repository.owner_repo() else {
+                return Ok(None);
+            };
+            if !cfg.allowlist_permits(ev.installation.id, owner) {
+                tracing::info!(
+                    %delivery,
+                    %owner,
+                    installation = ev.installation.id,
+                    "blocked by allowlist"
+                );
+                return Ok(None);
+            }
+            QueuedEvent::Issue(ev)
+        }
+        "issue_comment" => {
+            let ev: IssueCommentEvent = serde_json::from_slice(body).map_err(|error| {
+                nogent_core::NogentError::Payload(format!("issue_comment: {error}"))
+            })?;
+            if !matches!(ev.action.as_str(), "created" | "edited")
+                || ev.issue.pull_request.is_none()
+                || !events::is_review_command(&ev.comment.body)
+                || ev.comment.user.is_bot()
+            {
+                return Ok(None);
+            }
+            let Some((owner, _)) = ev.repository.owner_repo() else {
+                return Ok(None);
+            };
+            if !cfg.allowlist_permits(ev.installation.id, owner) {
+                tracing::info!(
+                    %delivery,
+                    %owner,
+                    installation = ev.installation.id,
+                    "blocked by allowlist"
+                );
+                return Ok(None);
+            }
+            QueuedEvent::Command(ev)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(QueuedDelivery {
+        delivery: delivery.to_string(),
+        event,
+    }))
+}
+
+async fn dispatch(state: &AppState, queued: QueuedDelivery) -> Result<()> {
+    match queued.event {
+        QueuedEvent::Pr(event) => dispatch_pr(state, &queued.delivery, event).await,
+        QueuedEvent::Issue(event) => dispatch_issue(state, &queued.delivery, event).await,
+        QueuedEvent::Command(event) => dispatch_command(state, &queued.delivery, event).await,
     }
 }
 
@@ -117,28 +269,10 @@ fn pr_job(
     })
 }
 
-/// `/nogent review` posted as a PR comment → re-review the PR's latest commit.
-async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
-    let ev: nogent_core::events::IssueCommentEvent = serde_json::from_slice(body)
-        .map_err(|e| nogent_core::NogentError::Payload(format!("issue_comment: {e}")))?;
-
-    // Only created/edited comments, only on PRs, only the exact command,
-    // and not from a bot (prevents loops where another bot echoes the command).
-    if !matches!(ev.action.as_str(), "created" | "edited")
-        || ev.issue.pull_request.is_none()
-        || !events::is_review_command(&ev.comment.body)
-        || ev.comment.user.is_bot()
-    {
-        return Ok(());
-    }
+async fn dispatch_command(state: &AppState, delivery: &str, ev: IssueCommentEvent) -> Result<()> {
     let Some((owner, repo)) = ev.repository.owner_repo() else {
         return Ok(());
     };
-    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
-        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
-        return Ok(());
-    }
-
     let token = state
         .auth
         .installation_token(ev.installation.id, owner, repo)
@@ -149,6 +283,7 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     }
 
     // Fetch the PR for fresh head/base SHAs (the comment payload lacks them).
+    // This is a trusted-listener direct client; it never honors worker base URLs.
     let gh = crate::github_client::GithubClient::new(&token)?;
     let pr = gh.get_pull_request(owner, repo, ev.issue.number).await?;
     let Some(job) = pr_job(&ev.repository, &pr, cfg, state.cfg.gemini_model.clone()) else {
@@ -160,29 +295,10 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
     Ok(())
 }
 
-async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
-    let ev: PullRequestEvent = serde_json::from_slice(body)
-        .map_err(|e| nogent_core::NogentError::Payload(format!("pull_request: {e}")))?;
-
-    if !events::is_actionable_pr_action(&ev.action) || ev.pull_request.draft {
-        tracing::debug!(%delivery, action = %ev.action, draft = ev.pull_request.draft, "skipping PR");
-        return Ok(());
-    }
-    // Skip bot-authored PRs (dependabot, renovate, etc.). A maintainer who
-    // genuinely wants one reviewed can still trigger it with `/nogent review`.
-    if ev.pull_request.user.is_bot() {
-        tracing::info!(%delivery, author = %ev.pull_request.user.login, "skipping bot-authored PR");
-        return Ok(());
-    }
+async fn dispatch_pr(state: &AppState, delivery: &str, ev: PullRequestEvent) -> Result<()> {
     let Some((owner, repo)) = ev.repository.owner_repo() else {
-        tracing::warn!(%delivery, full_name = %ev.repository.full_name, "bad repo full_name");
         return Ok(());
     };
-    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
-        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
-        return Ok(());
-    }
-
     let token = state
         .auth
         .installation_token(ev.installation.id, owner, repo)
@@ -202,28 +318,15 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
     ) else {
         return Ok(());
     };
-
     worker::run(&state.cfg, &token, &job).await?;
     tracing::info!(%delivery, pr = number, "reviewed PR");
     Ok(())
 }
 
-async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result<()> {
-    let ev: IssueEvent = serde_json::from_slice(body)
-        .map_err(|e| nogent_core::NogentError::Payload(format!("issues: {e}")))?;
-
-    // Skip PRs that arrive on the issues event, and non-actionable actions.
-    if ev.issue.pull_request.is_some() || !events::is_actionable_issue_action(&ev.action) {
-        return Ok(());
-    }
+async fn dispatch_issue(state: &AppState, delivery: &str, ev: IssueEvent) -> Result<()> {
     let Some((owner, repo)) = ev.repository.owner_repo() else {
         return Ok(());
     };
-    if !state.cfg.allowlist_permits(ev.installation.id, owner) {
-        tracing::info!(%delivery, %owner, installation = ev.installation.id, "blocked by allowlist");
-        return Ok(());
-    }
-
     let token = state
         .auth
         .installation_token(ev.installation.id, owner, repo)
@@ -263,4 +366,93 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
 async fn resolve_config(token: &str, owner: &str, repo: &str) -> Result<ResolvedConfig> {
     let raw = github_mint::fetch_repo_config(token, owner, repo).await?;
     ResolvedConfig::resolve(raw.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::config::WorkerIsolation;
+
+    fn config() -> ListenerConfig {
+        ListenerConfig {
+            app_id: "1".into(),
+            private_key_pem: Zeroizing::new(String::new()),
+            webhook_secret: Zeroizing::new("secret".into()),
+            gemini_api_key: Zeroizing::new("gemini".into()),
+            gemini_model: "model".into(),
+            gemini_thinking_level: None,
+            bind_addr: String::new(),
+            max_body_bytes: 2_097_152,
+            allowed_owners: Vec::new(),
+            allowed_installations: Vec::new(),
+            worker_isolation: WorkerIsolation::InProcess,
+            max_concurrent_jobs: 2,
+            max_queued_jobs: 100,
+            worker_timeout: Duration::from_secs(900),
+            prompts_dir: None,
+        }
+    }
+
+    #[test]
+    fn no_op_pr_is_filtered_before_queueing() {
+        let raw = br#"{
+            "action":"synchronize",
+            "installation":{"id":1},
+            "repository":{"full_name":"o/r","default_branch":"main"},
+            "pull_request":{
+                "number":7,"title":"t","draft":false,"html_url":"https://x",
+                "user":{"login":"alice","type":"User"},
+                "head":{"ref":"feature","sha":"abc"},
+                "base":{"ref":"main","sha":"def"}
+            }
+        }"#;
+        assert!(
+            classify_delivery(&config(), "pull_request", "d1", raw)
+                .expect("valid")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn actionable_pr_is_queued_after_payload_filtering() {
+        let raw = br#"{
+            "action":"opened",
+            "installation":{"id":1},
+            "repository":{"full_name":"o/r","default_branch":"main"},
+            "pull_request":{
+                "number":7,"title":"t","draft":false,"html_url":"https://x",
+                "user":{"login":"alice","type":"User"},
+                "head":{"ref":"feature","sha":"abc"},
+                "base":{"ref":"main","sha":"def"}
+            }
+        }"#;
+        assert!(
+            classify_delivery(&config(), "pull_request", "d1", raw)
+                .expect("valid")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bot_comment_is_filtered_before_queueing() {
+        let raw = br#"{
+            "action":"created",
+            "installation":{"id":1},
+            "repository":{"full_name":"o/r","default_branch":"main"},
+            "issue":{
+                "number":7,"title":"t","html_url":"https://x",
+                "user":{"login":"alice"},"pull_request":{"url":"https://api"}
+            },
+            "comment":{"body":"/nogent review","user":{"login":"nogent[bot]","type":"Bot"}}
+        }"#;
+        assert!(
+            classify_delivery(&config(), "issue_comment", "d1", raw)
+                .expect("valid")
+                .is_none()
+        );
+    }
 }
