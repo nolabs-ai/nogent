@@ -40,6 +40,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Local eval mode: review a diff against a local checkout, no GitHub.
     //   GEMINI_API_KEY=... nogent-listener --review-local --repo . --diff change.diff
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--worker-preflight") {
+        return worker::preflight_child().await;
+    }
     if args.iter().any(|a| a == "--worker") {
         return worker::run_from_stdin().await;
     }
@@ -48,15 +51,18 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let cfg = ListenerConfig::from_env()?;
+    worker::preflight(&cfg).await?;
     let auth = AppAuth::new(&cfg.app_id, &cfg.private_key_pem)?;
     let bind_addr = cfg.bind_addr.clone();
     let max_body = cfg.max_body_bytes;
 
+    let (job_tx, job_rx) = tokio::sync::mpsc::channel(cfg.max_queued_jobs);
     let state = AppState {
-        worker_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_jobs)),
         cfg: Arc::new(cfg),
         auth: Arc::new(auth),
+        job_tx,
     };
+    let _dispatcher = webhook::start_dispatcher(state.clone(), job_rx);
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))

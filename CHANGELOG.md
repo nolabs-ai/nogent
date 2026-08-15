@@ -10,8 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Run fork-controlled review and triage jobs in a least-privilege nono worker
   with phantom GitHub/Gemini credentials and endpoint-limited egress.
-- Bound concurrent workers and return HTTP 429 when saturated so GitHub can
-  retry without causing unbounded process growth.
+- Bound concurrent workers behind a 100-item default queue, filter no-op
+  deliveries before enqueueing, and fail visibly with HTTP 503 if that queue is
+  exhausted. GitHub does not automatically redeliver failed webhooks.
+- Fail startup unless a real nono child can launch with the configured profile,
+  phantom credentials, loopback proxies, executable, and optional prompt path.
+- Apply an overall worker deadline so a wedged supervisor cannot consume a
+  concurrency slot forever.
 
 ## [0.2.3] - 2026-06-30
 

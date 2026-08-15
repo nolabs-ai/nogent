@@ -47,8 +47,14 @@ To mitigate this, nogent implements several layers of defense:
   endpoints required for its target repository, Gemini generation, and
   GitHub's tarball host. It has no filesystem write capability or working
   directory access.
-- **Bounded workers** — valid webhook bursts receive HTTP 429 once the worker
-  pool is full, allowing GitHub to retry without creating unbounded processes.
+- **Bounded workers and queue** — payload-only no-op events are discarded before
+  enqueueing; actionable deliveries wait in a bounded queue and run with fixed
+  concurrency plus an overall deadline. Queue exhaustion is a visible HTTP 503
+  that requires manual or automated GitHub redelivery.
+- **Fail-closed startup** — production mode launches a real sandbox preflight
+  before binding the webhook listener, catching broken profiles, binary paths,
+  phantom injection, proxy URLs, and optional prompt grants before any delivery
+  can be acknowledged.
 
 In addition to the app-layer defenses above, the published image is signed and verified,
 and the runtime is hardened:
@@ -81,6 +87,8 @@ Two layers, for two audiences:
 - **Operator-level base prompt — `NOGENT_PROMPTS_DIR`**: whoever *runs* nogent
   can replace the whole system prompt (the Markdown in
   [`crates/nogent-core/prompts/`](crates/nogent-core/prompts/)) without a rebuild.
+  In sandbox mode this directory is validated at startup and granted read-only
+  to the worker.
 
 ## Crates
 

@@ -8,6 +8,7 @@ use nogent_core::output_validator::{
 };
 use nogent_core::prompts::issue_triage;
 
+use crate::api_base::WorkerApiBases;
 use crate::gemini_client::GeminiClient;
 use crate::github_client::GithubClient;
 
@@ -16,8 +17,12 @@ pub async fn run(
     thinking_level: Option<&str>,
     token: &str,
     job: &EventJob,
+    api_bases: Option<&WorkerApiBases>,
 ) -> Result<()> {
-    let gh = GithubClient::new(token)?;
+    let gh = match api_bases {
+        Some(bases) => GithubClient::new_for_worker(token, &bases.github)?,
+        None => GithubClient::new(token)?,
+    };
 
     // Maintainer guidance from NOGENT.md on the default branch (trusted).
     let guidance = if job.default_branch.is_empty() {
@@ -31,7 +36,12 @@ pub async fn run(
     let system = issue_triage::system_instruction(&canary, guidance.as_deref());
     let user = issue_triage::user_prompt(job);
 
-    let gemini = GeminiClient::new(gemini_api_key, &job.model, thinking_level)?;
+    let gemini = match api_bases {
+        Some(bases) => {
+            GeminiClient::new_for_worker(gemini_api_key, &job.model, thinking_level, &bases.gemini)?
+        }
+        None => GeminiClient::new(gemini_api_key, &job.model, thinking_level)?,
+    };
     let raw = gemini.generate(&system, &user).await?;
 
     let body = match validate_issue_triage(&raw, &canary) {

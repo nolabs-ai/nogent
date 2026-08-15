@@ -43,7 +43,29 @@ pub struct GeminiClient {
 
 impl GeminiClient {
     pub fn new(api_key: &str, model: &str, thinking_level: Option<&str>) -> Result<Self> {
-        let api_base = ApiBase::from_env("NOGENT_GEMINI_BASE_URL", GEMINI_API)?;
+        Self::with_base(
+            api_key,
+            model,
+            thinking_level,
+            ApiBase::direct("Gemini API", GEMINI_API)?,
+        )
+    }
+
+    pub fn new_for_worker(
+        api_key: &str,
+        model: &str,
+        thinking_level: Option<&str>,
+        api_base: &ApiBase,
+    ) -> Result<Self> {
+        Self::with_base(api_key, model, thinking_level, api_base.clone())
+    }
+
+    fn with_base(
+        api_key: &str,
+        model: &str,
+        thinking_level: Option<&str>,
+        api_base: ApiBase,
+    ) -> Result<Self> {
         // Bake the API key into default headers as a *sensitive* value so it
         // doesn't sit in a plain `String` field and so tracing layers can
         // detect and redact it instead of dumping the key into logs.
@@ -81,6 +103,23 @@ impl GeminiClient {
             thinking_tokens: self.usage.thinking.load(Ordering::Relaxed),
             cached_tokens: self.usage.cached.load(Ordering::Relaxed),
         }
+    }
+
+    /// As with the GitHub probe, a policy-denied path must return 403 after
+    /// successful phantom validation and before any upstream request.
+    pub async fn verify_worker_proxy_auth(&self) -> Result<()> {
+        let response = self
+            .http
+            .get(format!("{}/nogent-auth-preflight", self.api_base))
+            .send()
+            .await?;
+        if response.status() != reqwest::StatusCode::FORBIDDEN {
+            return Err(NogentError::Auth(format!(
+                "Gemini worker proxy auth preflight expected 403, got {}",
+                response.status().as_u16()
+            )));
+        }
+        Ok(())
     }
 
     async fn post(&self, req: &GenerateRequest) -> Result<GenerateResponse> {

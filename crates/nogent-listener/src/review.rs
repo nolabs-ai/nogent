@@ -19,6 +19,7 @@ use nogent_core::prompts::pr_review;
 use nogent_core::repo_config::ResolvedConfig;
 use serde_json::{Value, json};
 
+use crate::api_base::WorkerApiBases;
 use crate::gemini_client::GeminiClient;
 use crate::github_client::{GithubClient, InlineComment};
 use crate::repo_index::RepoIndex;
@@ -63,8 +64,12 @@ pub async fn run(
     thinking_level: Option<&str>,
     token: &str,
     job: &EventJob,
+    api_bases: Option<&WorkerApiBases>,
 ) -> Result<()> {
-    let gh = GithubClient::new(token)?;
+    let gh = match api_bases {
+        Some(bases) => GithubClient::new_for_worker(token, &bases.github)?,
+        None => GithubClient::new(token)?,
+    };
     let files = gh.list_pr_files(&job.owner, &job.repo, job.number).await?;
     let digest = build_digest(&files, job.config.max_files, job.config.max_patch_bytes);
 
@@ -108,7 +113,12 @@ pub async fn run(
 
     let canary = generate_canary();
     let system = pr_review::system_instruction(&canary, guidance.as_deref());
-    let gemini = GeminiClient::new(gemini_api_key, &job.model, thinking_level)?;
+    let gemini = match api_bases {
+        Some(bases) => {
+            GeminiClient::new_for_worker(gemini_api_key, &job.model, thinking_level, &bases.gemini)?
+        }
+        None => GeminiClient::new(gemini_api_key, &job.model, thinking_level)?,
+    };
 
     let mut session = AgentSession::new(&gemini, &system, index.as_ref(), user);
     let review = run_review(&mut session, &canary).await?;
