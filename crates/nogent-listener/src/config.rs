@@ -9,9 +9,12 @@ use nogent_core::error::{NogentError, Result};
 use zeroize::Zeroizing;
 
 pub struct ListenerConfig {
-    pub app_id: String,
-    pub private_key_pem: Zeroizing<String>,
-    pub webhook_secret: Zeroizing<String>,
+    /// GitHub App credentials. All three are `Some` together (GitHub enabled) or
+    /// all `None` (question-only mode — the `/api/github/webhooks` ingress and
+    /// PR/issue jobs are not served). See [`ListenerConfig::github_enabled`].
+    pub app_id: Option<String>,
+    pub private_key_pem: Option<Zeroizing<String>>,
+    pub webhook_secret: Option<Zeroizing<String>>,
     pub gemini_api_key: Zeroizing<String>,
     pub gemini_model: String,
     /// Reasoning level for thinking-capable models (Gemini 3.x): minimal | low |
@@ -54,6 +57,13 @@ pub enum WorkerIsolation {
 }
 
 impl ListenerConfig {
+    /// True when GitHub App credentials are configured, so the webhook ingress
+    /// and PR/issue jobs should be served. False = question-only mode.
+    #[must_use]
+    pub fn github_enabled(&self) -> bool {
+        self.app_id.is_some() && self.private_key_pem.is_some() && self.webhook_secret.is_some()
+    }
+
     /// True if this `(installation, owner)` is permitted by the allowlist.
     /// An empty allowlist on a given field means "no restriction" for that
     /// field, so an unset listener accepts every installation (the historical
@@ -88,27 +98,57 @@ fn opt(key: &str, default: &str) -> String {
 /// that is unset, from the file at `GITHUB_APP_PRIVATE_KEY_FILE`. The file form
 /// is preferred for deployment: a multi-line PEM does not fit cleanly in a
 /// systemd `EnvironmentFile`, so the deploy writes it to a 0600 file instead.
-fn load_private_key() -> Result<Zeroizing<String>> {
-    if let Ok(inline) = env::var("GITHUB_APP_PRIVATE_KEY") {
-        return Ok(Zeroizing::new(inline));
+///
+/// Returns `None` when neither is set (question-only mode). A set-but-unreadable
+/// file is still an error — that is a misconfiguration, not "GitHub disabled".
+fn load_private_key() -> Result<Option<Zeroizing<String>>> {
+    if let Ok(inline) = env::var("GITHUB_APP_PRIVATE_KEY")
+        && !inline.trim().is_empty()
+    {
+        return Ok(Some(Zeroizing::new(inline)));
     }
-    let path = env::var("GITHUB_APP_PRIVATE_KEY_FILE").map_err(|_| {
-        NogentError::Config(
-            "set GITHUB_APP_PRIVATE_KEY (inline PEM) or GITHUB_APP_PRIVATE_KEY_FILE (path)".into(),
-        )
-    })?;
-    let pem = std::fs::read_to_string(&path).map_err(|e| {
-        NogentError::Config(format!("reading GITHUB_APP_PRIVATE_KEY_FILE {path}: {e}"))
-    })?;
-    Ok(Zeroizing::new(pem))
+    match env::var("GITHUB_APP_PRIVATE_KEY_FILE") {
+        Ok(path) if !path.trim().is_empty() => {
+            let pem = std::fs::read_to_string(&path).map_err(|e| {
+                NogentError::Config(format!("reading GITHUB_APP_PRIVATE_KEY_FILE {path}: {e}"))
+            })?;
+            Ok(Some(Zeroizing::new(pem)))
+        }
+        _ => Ok(None),
+    }
 }
 
 impl ListenerConfig {
-    /// Load from environment, failing if any required secret is absent
-    /// (fail-secure: we never start without the webhook secret + app key).
+    /// Load from environment. GitHub App creds are optional but all-or-none: set
+    /// all three (App id, private key, webhook secret) to serve the GitHub
+    /// webhook, or none for question-only mode. `GEMINI_API_KEY` is always
+    /// required. Fails if neither GitHub nor the triage secret is configured
+    /// (nothing to serve).
     pub fn from_env() -> Result<Self> {
+        let app_id = env::var("GITHUB_APP_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let private_key_pem = load_private_key()?;
-        let webhook_secret = Zeroizing::new(req("GITHUB_WEBHOOK_SECRET")?);
+        let webhook_secret = env::var("GITHUB_WEBHOOK_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(Zeroizing::new);
+        // All-or-none: a partial GitHub config is a mistake, not a mode.
+        let github_set = [
+            app_id.is_some(),
+            private_key_pem.is_some(),
+            webhook_secret.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if github_set != 0 && github_set != 3 {
+            return Err(NogentError::Config(
+                "partial GitHub config: set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY (or _FILE) and \
+GITHUB_WEBHOOK_SECRET together, or none of them for question-only mode"
+                    .into(),
+            ));
+        }
         let gemini_api_key = Zeroizing::new(req("GEMINI_API_KEY")?);
 
         let max_body_bytes = opt("NOGENT_MAX_BODY_BYTES", "2097152")
@@ -150,8 +190,17 @@ impl ListenerConfig {
                 NogentError::Config(format!("NOGENT_TRIAGE_MAX_CONTEXT_BYTES invalid: {e}"))
             })?;
 
+        // Refuse to boot a server with no ingress.
+        if github_set == 0 && triage_ingress_secret.is_none() {
+            return Err(NogentError::Config(
+                "nothing to serve: configure the GitHub App credentials or set \
+NOGENT_TRIAGE_SECRET to enable POST /api/triage"
+                    .into(),
+            ));
+        }
+
         Ok(ListenerConfig {
-            app_id: req("GITHUB_APP_ID")?,
+            app_id,
             private_key_pem,
             webhook_secret,
             gemini_api_key,
@@ -224,9 +273,9 @@ mod tests {
 
     fn cfg_with(owners: &[&str], installs: &[u64]) -> ListenerConfig {
         ListenerConfig {
-            app_id: "1".into(),
-            private_key_pem: Zeroizing::new(String::new()),
-            webhook_secret: Zeroizing::new(String::new()),
+            app_id: Some("1".into()),
+            private_key_pem: Some(Zeroizing::new(String::new())),
+            webhook_secret: Some(Zeroizing::new(String::new())),
             gemini_api_key: Zeroizing::new(String::new()),
             gemini_model: String::new(),
             gemini_thinking_level: None,
@@ -245,6 +294,17 @@ mod tests {
     fn empty_allowlist_permits_everything() {
         let c = cfg_with(&[], &[]);
         assert!(c.allowlist_permits(42, "anyone"));
+    }
+
+    #[test]
+    fn github_enabled_requires_all_three_creds() {
+        let mut c = cfg_with(&[], &[]);
+        assert!(c.github_enabled());
+        c.webhook_secret = None;
+        assert!(!c.github_enabled());
+        c.app_id = None;
+        c.private_key_pem = None;
+        assert!(!c.github_enabled()); // question-only mode
     }
 
     #[test]

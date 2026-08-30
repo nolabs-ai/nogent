@@ -53,20 +53,31 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     let cfg = ListenerConfig::from_env()?;
-    let auth = AppAuth::new(&cfg.app_id, &cfg.private_key_pem)?;
     let bind_addr = cfg.bind_addr.clone();
     let max_body = cfg.max_body_bytes;
+    let github_enabled = cfg.github_enabled();
+    let triage_enabled = cfg.triage_ingress_secret.is_some();
+
+    // Build the GitHub App auth only when creds are configured. In question-only
+    // mode there is no App key to parse and the webhook route is not mounted.
+    let auth = match (cfg.app_id.as_deref(), cfg.private_key_pem.as_ref()) {
+        (Some(app_id), Some(pem)) => Some(Arc::new(AppAuth::new(app_id, pem)?)),
+        _ => None,
+    };
 
     let state = AppState {
         worker_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_jobs)),
         cfg: Arc::new(cfg),
-        auth: Arc::new(auth),
+        auth,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/api/github/webhooks", post(webhook::handle_webhook))
-        .route("/api/triage", post(triage_ingress::handle_triage))
+        .route("/api/triage", post(triage_ingress::handle_triage));
+    if github_enabled {
+        app = app.route("/api/github/webhooks", post(webhook::handle_webhook));
+    }
+    let app = app
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -74,7 +85,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| NogentError::Config(format!("cannot bind {bind_addr}: {e}")))?;
-    tracing::info!(%bind_addr, "nogent-listener started");
+    tracing::info!(%bind_addr, github_enabled, triage_enabled, "nogent-listener started");
     axum::serve(listener, app)
         .await
         .map_err(|e| NogentError::Io(e.to_string()))?;
