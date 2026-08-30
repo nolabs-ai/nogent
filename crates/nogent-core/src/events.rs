@@ -147,6 +147,65 @@ pub fn is_actionable_issue_action(action: &str) -> bool {
 pub enum JobKind {
     PrReview,
     IssueTriage,
+    /// Source-agnostic Q&A triage. Grounded solely on caller-supplied
+    /// `context`; needs no GitHub token, fetches no tarball/`RepoIndex`, and
+    /// returns its answer to the caller instead of posting a comment.
+    Question,
+}
+
+/// One caller-supplied grounding source for a [`JobKind::Question`] run. The
+/// caller (which owns retrieval/memory) supplies retrieved KB/doc/issue chunks,
+/// each identified by `source_id` so the model can cite it reliably. ALL fields
+/// are UNTRUSTED — they may echo user content — and are wrapped in
+/// untrusted-content framing by the question prompt. `trust` is the one signal
+/// the model is told to weight (verified over community over unverified).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSource {
+    /// Stable identifier the model must echo in `citations`/`possible_duplicates`
+    /// (e.g. `github:issue:123`). Answers referencing an id not present here are
+    /// rejected by the validator.
+    pub source_id: String,
+    /// Caller-defined taxonomy label (e.g. `closed_issue`, `doc`, `discussion`).
+    /// Free-form — a hint to the model, not constrained by nogent.
+    #[serde(default)]
+    pub source_type: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+    /// Product/doc version this source pertains to, for version-aware answers.
+    #[serde(default)]
+    pub version: String,
+    pub content: String,
+    /// Canonicality signal: `verified` | `community` | `unverified`.
+    #[serde(default)]
+    pub trust: String,
+}
+
+/// One turn of prior conversation for a [`JobKind::Question`] run. `role` is the
+/// source-agnostic dialogue position (`user` | `assistant`); speaker authority
+/// is NOT encoded here — it belongs on [`ContextSource::trust`]. UNTRUSTED.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    /// `user` (asker) or `assistant` (a prior reply). No `system` role: caller
+    /// content is never treated as authoritative instructions.
+    pub role: String,
+    pub content: String,
+    /// Optional display name; a label only, never weighted by the model.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The full source-agnostic input for a [`JobKind::Question`] run. The caller
+/// owns retrieval and dialogue assembly; nogent grounds solely on this plus
+/// model knowledge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuestionInput {
+    pub question: String,
+    #[serde(default)]
+    pub conversation: Vec<ConversationTurn>,
+    #[serde(default)]
+    pub context: Vec<ContextSource>,
 }
 
 /// A normalized per-event unit of work: event facts + resolved config + the
@@ -171,8 +230,41 @@ pub struct EventJob {
     pub base_sha: Option<String>,
     pub head_ref: Option<String>,
     pub head_sha: Option<String>,
+    /// Caller-supplied input for [`JobKind::Question`] jobs (`None` for
+    /// GitHub-derived jobs). Defaulted so existing PR/issue payloads still
+    /// deserialize unchanged.
+    #[serde(default)]
+    pub question: Option<QuestionInput>,
     pub config: ResolvedConfig,
     pub model: String,
+}
+
+impl EventJob {
+    /// Build a source-agnostic [`JobKind::Question`] job. Carries no GitHub
+    /// identity (owner/repo/number/URLs are empty) — grounding comes solely
+    /// from the [`QuestionInput`].
+    #[must_use]
+    pub fn question(input: QuestionInput, model: String) -> Self {
+        EventJob {
+            kind: JobKind::Question,
+            repo_full_name: String::new(),
+            owner: String::new(),
+            repo: String::new(),
+            number: 0,
+            title: String::new(),
+            body: String::new(),
+            author: String::new(),
+            html_url: String::new(),
+            default_branch: String::new(),
+            base_ref: None,
+            base_sha: None,
+            head_ref: None,
+            head_sha: None,
+            question: Some(input),
+            config: ResolvedConfig::default(),
+            model,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +325,45 @@ mod tests {
         assert!(bot.is_bot());
         assert!(bot_lower.is_bot());
         assert!(!missing.is_bot()); // default → "" → treated as human
+    }
+
+    #[test]
+    fn question_job_has_no_github_identity() {
+        let job = EventJob::question(
+            QuestionInput {
+                question: "How do I allow /tmp?".into(),
+                conversation: vec![],
+                context: vec![ContextSource {
+                    source_id: "github:issue:123".into(),
+                    source_type: "closed_issue".into(),
+                    title: "allow /tmp".into(),
+                    url: "https://x".into(),
+                    version: "2.4".into(),
+                    content: "use --allow".into(),
+                    trust: "verified".into(),
+                }],
+            },
+            "gemini-3.5-flash".into(),
+        );
+        assert_eq!(job.kind, JobKind::Question);
+        assert!(job.owner.is_empty() && job.repo.is_empty());
+        assert_eq!(job.number, 0);
+        assert!(job.default_branch.is_empty());
+        assert_eq!(job.question.expect("question").context.len(), 1);
+    }
+
+    #[test]
+    fn legacy_job_without_question_deserializes() {
+        // Payloads serialized before `question` existed must still parse.
+        let job = EventJob::question(QuestionInput::default(), "m".into());
+        let mut value = serde_json::to_value(&job).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("question")
+            .expect("question present");
+        let parsed: EventJob = serde_json::from_value(value).expect("parse without question");
+        assert!(parsed.question.is_none());
     }
 
     #[test]

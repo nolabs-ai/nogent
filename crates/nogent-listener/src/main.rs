@@ -9,9 +9,11 @@ mod config;
 mod gemini_client;
 mod github_client;
 mod github_mint;
+mod question;
 mod repo_index;
 mod review;
 mod triage;
+mod triage_ingress;
 mod webhook;
 mod worker;
 
@@ -31,7 +33,10 @@ use crate::webhook::AppState;
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Load .env in dev; ignore if absent.
     let _ = dotenvy::dotenv();
+    // Log to stderr: stdout is a data channel for the sandboxed Question worker,
+    // whose answer JSON the parent captures verbatim.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -61,6 +66,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/github/webhooks", post(webhook::handle_webhook))
+        .route("/api/triage", post(triage_ingress::handle_triage))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

@@ -81,6 +81,7 @@ mod tests {
             base_sha: Some("aaa".into()),
             head_ref: Some("feat".into()),
             head_sha: Some("bbb".into()),
+            question: None,
             config: ResolvedConfig::default(),
             model: "gemini-2.5-pro".into(),
         }

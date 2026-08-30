@@ -32,6 +32,12 @@ pub struct ListenerConfig {
     /// Hard cap on simultaneous jobs. The webhook returns 429 when saturated so
     /// GitHub retries instead of letting valid deliveries create unbounded work.
     pub max_concurrent_jobs: usize,
+    /// Shared secret for the non-GitHub `POST /api/triage` ingress. `None` (unset
+    /// `NOGENT_TRIAGE_SECRET`) disables the endpoint entirely (fail-secure).
+    pub triage_ingress_secret: Option<Zeroizing<String>>,
+    /// Max serialized bytes of caller-supplied `context` accepted by
+    /// `/api/triage`. Bounds untrusted grounding before it reaches the model.
+    pub triage_max_context_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +48,8 @@ pub enum WorkerIsolation {
     Nono {
         binary: String,
         profile: String,
+        /// Gemini-only profile for Question jobs (no GitHub egress).
+        question_profile: String,
     },
 }
 
@@ -117,6 +125,10 @@ impl ListenerConfig {
                 "NOGENT_NONO_PROFILE",
                 "/usr/share/nogent/nogent-worker.nono.json",
             ),
+            &opt(
+                "NOGENT_NONO_QUESTION_PROFILE",
+                "/usr/share/nogent/nogent-question.nono.json",
+            ),
         )?;
         let max_concurrent_jobs = opt("NOGENT_MAX_CONCURRENT_JOBS", "2")
             .parse::<usize>()
@@ -126,6 +138,17 @@ impl ListenerConfig {
                 "NOGENT_MAX_CONCURRENT_JOBS must be between 1 and 32".into(),
             ));
         }
+
+        // Fail-secure: only enable /api/triage when a non-empty secret is set.
+        let triage_ingress_secret = match env::var("NOGENT_TRIAGE_SECRET") {
+            Ok(secret) if !secret.trim().is_empty() => Some(Zeroizing::new(secret)),
+            _ => None,
+        };
+        let triage_max_context_bytes = opt("NOGENT_TRIAGE_MAX_CONTEXT_BYTES", "262144")
+            .parse::<usize>()
+            .map_err(|e| {
+                NogentError::Config(format!("NOGENT_TRIAGE_MAX_CONTEXT_BYTES invalid: {e}"))
+            })?;
 
         Ok(ListenerConfig {
             app_id: req("GITHUB_APP_ID")?,
@@ -143,11 +166,18 @@ impl ListenerConfig {
             allowed_installations,
             worker_isolation,
             max_concurrent_jobs,
+            triage_ingress_secret,
+            triage_max_context_bytes,
         })
     }
 }
 
-fn parse_worker_isolation(mode: &str, binary: &str, profile: &str) -> Result<WorkerIsolation> {
+fn parse_worker_isolation(
+    mode: &str,
+    binary: &str,
+    profile: &str,
+    question_profile: &str,
+) -> Result<WorkerIsolation> {
     match mode.trim().to_ascii_lowercase().as_str() {
         "in-process" => Ok(WorkerIsolation::InProcess),
         "nono" if binary.trim().is_empty() => Err(NogentError::Config(
@@ -156,9 +186,13 @@ fn parse_worker_isolation(mode: &str, binary: &str, profile: &str) -> Result<Wor
         "nono" if profile.trim().is_empty() => Err(NogentError::Config(
             "NOGENT_NONO_PROFILE cannot be empty in nono worker mode".into(),
         )),
+        "nono" if question_profile.trim().is_empty() => Err(NogentError::Config(
+            "NOGENT_NONO_QUESTION_PROFILE cannot be empty in nono worker mode".into(),
+        )),
         "nono" => Ok(WorkerIsolation::Nono {
             binary: binary.to_string(),
             profile: profile.to_string(),
+            question_profile: question_profile.to_string(),
         }),
         other => Err(NogentError::Config(format!(
             "NOGENT_WORKER_MODE must be 'in-process' or 'nono', got '{other}'"
@@ -202,6 +236,8 @@ mod tests {
             allowed_installations: installs.to_vec(),
             worker_isolation: WorkerIsolation::InProcess,
             max_concurrent_jobs: 2,
+            triage_ingress_secret: None,
+            triage_max_context_bytes: 262_144,
         }
     }
 
@@ -244,14 +280,20 @@ mod tests {
     #[test]
     fn worker_isolation_is_explicit_and_fail_secure() {
         assert!(matches!(
-            parse_worker_isolation("in-process", "", ""),
+            parse_worker_isolation("in-process", "", "", ""),
             Ok(WorkerIsolation::InProcess)
         ));
         assert!(matches!(
-            parse_worker_isolation("nono", "/usr/bin/nono", "/etc/nogent/worker.json"),
+            parse_worker_isolation(
+                "nono",
+                "/usr/bin/nono",
+                "/etc/nogent/worker.json",
+                "/etc/nogent/question.json"
+            ),
             Ok(WorkerIsolation::Nono { .. })
         ));
-        assert!(parse_worker_isolation("nono", "", "profile").is_err());
-        assert!(parse_worker_isolation("unknown", "nono", "profile").is_err());
+        assert!(parse_worker_isolation("nono", "", "profile", "question").is_err());
+        assert!(parse_worker_isolation("nono", "nono", "profile", "").is_err());
+        assert!(parse_worker_isolation("unknown", "nono", "profile", "question").is_err());
     }
 }

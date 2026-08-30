@@ -129,6 +129,9 @@ The listener reads these (see [`.env.example`](.env.example)):
 | `NOGENT_WORKER_MODE` | no | `nono` or `in-process`; the published image defaults to `nono` |
 | `NOGENT_NONO_BIN` | no | nono executable, default `/usr/bin/nono` |
 | `NOGENT_NONO_PROFILE` | no | worker profile; image default is `/usr/share/nogent/nogent-worker.nono.json` |
+| `NOGENT_NONO_QUESTION_PROFILE` | no | Gemini-only profile for `/api/triage` question jobs; image default `/usr/share/nogent/nogent-question.nono.json` |
+| `NOGENT_TRIAGE_SECRET` | no | shared bearer secret for `POST /api/triage`; **unset disables the endpoint** (fail-secure) |
+| `NOGENT_TRIAGE_MAX_CONTEXT_BYTES` | no | cap on caller-supplied `context` bytes for `/api/triage`, default 256 KiB |
 
 For AWS, store the three secrets as a **Secrets Manager JSON** with these keys
 (this is exactly what the Terraform user-data expects):

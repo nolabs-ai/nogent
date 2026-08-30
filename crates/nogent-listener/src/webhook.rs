@@ -112,6 +112,7 @@ fn pr_job(
         base_sha: Some(pr.base.sha.clone()),
         head_ref: Some(pr.head.ref_name.clone()),
         head_sha: Some(pr.head.sha.clone()),
+        question: None,
         config: cfg,
         model,
     })
@@ -250,6 +251,7 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
         base_sha: None,
         head_ref: None,
         head_sha: None,
+        question: None,
         config: cfg,
         model: state.cfg.gemini_model.clone(),
     };

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "meta": {
+    "name": "nogent-question",
+    "version": "1.0.0",
+    "description": "Least-privilege worker for source-agnostic Q&A triage; Gemini-only egress, no GitHub",
+    "author": "nolabs-ai"
+  },
+  "groups": {
+    "exclude": [
+      "system_write_linux",
+      "system_write_macos",
+      "system_read_macos",
+      "user_tools",
+      "homebrew_linux",
+      "homebrew_macos"
+    ]
+  },
+  "security": {
+    "signal_mode": "isolated",
+    "process_info_mode": "isolated",
+    "ipc_mode": "shared_memory_only",
+    "capability_elevation": false,
+    "wsl2_proxy_policy": "error"
+  },
+  "workdir": {
+    "access": "none"
+  },
+  "filesystem": {
+    "read_file": [
+      "/usr/bin/nogent-listener",
+      "/usr/local/bin/nogent-listener"
+    ],
+    "deny": [
+      "/etc/nogent",
+      "/private/etc/nogent"
+    ]
+  },
+  "network": {
+    "credentials": [
+      "nogent_gemini"
+    ],
+    "custom_credentials": {
+      "nogent_gemini": {
+        "upstream": "https://generativelanguage.googleapis.com",
+        "credential_key": "env://GEMINI_API_KEY",
+        "env_var": "GEMINI_API_KEY",
+        "inject_header": "x-goog-api-key",
+        "credential_format": "{}",
+        "endpoint_rules": [
+          { "method": "POST", "path": "/v1beta/models/*:generateContent" }
+        ]
+      }
+    }
+  },
+  "environment": {
+    "allow_vars": [
+      "PATH",
+      "HOME",
+      "TMPDIR",
+      "RUST_LOG",
+      "RUST_BACKTRACE",
+      "GEMINI_THINKING_LEVEL",
+      "GEMINI_API_KEY",
+      "NOGENT_GEMINI_BASE_URL",
+      "NOGENT_REQUIRE_PHANTOM_CREDENTIALS",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "no_proxy",
+      "NONO_*"
+    ],
+    "deny_vars": [
+      "GITHUB_TOKEN",
+      "GITHUB_APP_PRIVATE_KEY",
+      "GITHUB_APP_PRIVATE_KEY_FILE",
+      "GITHUB_WEBHOOK_SECRET"
+    ]
+  }
+}

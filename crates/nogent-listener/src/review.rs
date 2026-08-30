@@ -394,6 +394,7 @@ fn eval_job(model: &str) -> EventJob {
         base_sha: None,
         head_ref: None,
         head_sha: None,
+        question: None,
         config: ResolvedConfig::default(),
         model: model.to_string(),
     }

@@ -21,10 +21,12 @@ EnvironmentFile=/etc/nogent/nogent.env
 Environment=NOGENT_WORKER_MODE=nono
 Environment=NOGENT_NONO_BIN=/usr/bin/nono
 Environment=NOGENT_NONO_PROFILE=/etc/nogent/nogent-worker.nono.json
+Environment=NOGENT_NONO_QUESTION_PROFILE=/etc/nogent/nogent-question.nono.json
 Environment=HOME=/var/lib/nogent
 Environment=XDG_STATE_HOME=/var/lib/nogent
 StateDirectory=nogent
 ExecStartPre=/usr/bin/nono profile validate /etc/nogent/nogent-worker.nono.json
+ExecStartPre=/usr/bin/nono profile validate /etc/nogent/nogent-question.nono.json
 ExecStart=/usr/local/bin/nogent-listener
 Restart=on-failure
 RestartSec=2

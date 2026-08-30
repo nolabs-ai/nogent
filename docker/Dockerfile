@@ -64,10 +64,12 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=builder /usr/local/bin/nogent-listener /usr/bin/nogent-listener
 COPY --from=nono /usr/local/bin/nono /usr/bin/nono
 COPY deploy/nogent-worker.nono.json /usr/share/nogent/nogent-worker.nono.json
+COPY deploy/nogent-question.nono.json /usr/share/nogent/nogent-question.nono.json
 
 ENV NOGENT_WORKER_MODE=nono \
     NOGENT_NONO_BIN=/usr/bin/nono \
     NOGENT_NONO_PROFILE=/usr/share/nogent/nogent-worker.nono.json \
+    NOGENT_NONO_QUESTION_PROFILE=/usr/share/nogent/nogent-question.nono.json \
     HOME=/tmp/nogent-home \
     XDG_CONFIG_HOME=/tmp/nogent-config \
     XDG_STATE_HOME=/tmp/nogent-state \
