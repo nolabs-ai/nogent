@@ -22,8 +22,19 @@ use crate::{github_mint, worker};
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<ListenerConfig>,
-    pub auth: Arc<AppAuth>,
+    /// `None` in question-only mode; the webhook route is not mounted then, so
+    /// the GitHub dispatch paths never run without it.
+    pub auth: Option<Arc<AppAuth>>,
     pub worker_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// The GitHub App auth, or a config error if this is a question-only listener.
+/// Only reached from the webhook route, which is mounted only when GitHub is
+/// enabled — so in practice this always returns `Ok`.
+fn github_auth(state: &AppState) -> Result<&AppAuth> {
+    state.auth.as_deref().ok_or_else(|| {
+        nogent_core::NogentError::Config("GitHub integration is not configured".into())
+    })
 }
 
 const SIG_HEADER: &str = "x-hub-signature-256";
@@ -36,12 +47,16 @@ pub async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    // 0. Question-only listeners never mount this route; guard defensively.
+    let Some(webhook_secret) = state.cfg.webhook_secret.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
     // 1. Verify signature over the RAW body.
     let sig = headers.get(SIG_HEADER).and_then(|v| v.to_str().ok());
     let Some(sig) = sig else {
         return StatusCode::UNAUTHORIZED;
     };
-    if !verify_signature(state.cfg.webhook_secret.as_bytes(), &body, sig) {
+    if !verify_signature(webhook_secret.as_bytes(), &body, sig) {
         return StatusCode::UNAUTHORIZED;
     }
 
@@ -112,6 +127,7 @@ fn pr_job(
         base_sha: Some(pr.base.sha.clone()),
         head_ref: Some(pr.head.ref_name.clone()),
         head_sha: Some(pr.head.sha.clone()),
+        question: None,
         config: cfg,
         model,
     })
@@ -139,8 +155,7 @@ async fn dispatch_command(state: &AppState, delivery: &str, body: &[u8]) -> Resu
         return Ok(());
     }
 
-    let token = state
-        .auth
+    let token = github_auth(state)?
         .installation_token(ev.installation.id, owner, repo)
         .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
@@ -183,8 +198,7 @@ async fn dispatch_pr(state: &AppState, delivery: &str, body: &[u8]) -> Result<()
         return Ok(());
     }
 
-    let token = state
-        .auth
+    let token = github_auth(state)?
         .installation_token(ev.installation.id, owner, repo)
         .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
@@ -224,8 +238,7 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
         return Ok(());
     }
 
-    let token = state
-        .auth
+    let token = github_auth(state)?
         .installation_token(ev.installation.id, owner, repo)
         .await?;
     let cfg = resolve_config(&token, owner, repo).await?;
@@ -250,6 +263,7 @@ async fn dispatch_issue(state: &AppState, delivery: &str, body: &[u8]) -> Result
         base_sha: None,
         head_ref: None,
         head_sha: None,
+        question: None,
         config: cfg,
         model: state.cfg.gemini_model.clone(),
     };

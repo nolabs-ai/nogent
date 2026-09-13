@@ -55,6 +55,7 @@ mod tests {
             base_sha: None,
             head_ref: None,
             head_sha: None,
+            question: None,
             config: ResolvedConfig::default(),
             model: "gemini-2.5-pro".into(),
         };

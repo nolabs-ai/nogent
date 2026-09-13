@@ -116,10 +116,10 @@ The listener reads these (see [`.env.example`](.env.example)):
 
 | Var | Secret? | Notes |
 |-----|:------:|-------|
-| `GITHUB_APP_ID` | no | numeric App ID |
-| `GITHUB_APP_PRIVATE_KEY` *or* `GITHUB_APP_PRIVATE_KEY_FILE` | **yes** | inline PEM (`\n`-escaped) **or** path to a PEM file. Deploys use the file form. |
-| `GITHUB_WEBHOOK_SECRET` | **yes** | the `openssl rand` value |
-| `GEMINI_API_KEY` | **yes** | Gemini key |
+| `GITHUB_APP_ID` | no | numeric App ID. GitHub creds are **all-or-none**: set all three to serve the webhook + PR/issue jobs, or none for **question-only mode** (`/api/triage` only). |
+| `GITHUB_APP_PRIVATE_KEY` *or* `GITHUB_APP_PRIVATE_KEY_FILE` | **yes**¹ | inline PEM (`\n`-escaped) **or** path to a PEM file. Deploys use the file form. |
+| `GITHUB_WEBHOOK_SECRET` | **yes**¹ | the `openssl rand` value |
+| `GEMINI_API_KEY` | **yes** | Gemini key (always required) |
 | `GEMINI_MODEL` | no | default `gemini-3.5-flash` |
 | `GEMINI_THINKING_LEVEL` | no | reasoning effort for Gemini 3.x: `minimal\|low\|medium\|high` (default `high`); empty to omit (2.5 models) |
 | `NOGENT_BIND_ADDR` | no | default `127.0.0.1:8080` |
@@ -129,6 +129,14 @@ The listener reads these (see [`.env.example`](.env.example)):
 | `NOGENT_WORKER_MODE` | no | `nono` or `in-process`; the published image defaults to `nono` |
 | `NOGENT_NONO_BIN` | no | nono executable, default `/usr/bin/nono` |
 | `NOGENT_NONO_PROFILE` | no | worker profile; image default is `/usr/share/nogent/nogent-worker.nono.json` |
+| `NOGENT_NONO_QUESTION_PROFILE` | no | Gemini-only profile for `/api/triage` question jobs; image default `/usr/share/nogent/nogent-question.nono.json` |
+| `NOGENT_TRIAGE_SECRET` | no | shared bearer secret for `POST /api/triage`; **unset disables the endpoint** (fail-secure) |
+| `NOGENT_TRIAGE_MAX_CONTEXT_BYTES` | no | cap on caller-supplied `context` bytes for `/api/triage`, default 256 KiB |
+
+¹ Required only when running the GitHub integration. For **question-only mode**
+omit all GitHub creds and set `NOGENT_TRIAGE_SECRET`; the server then serves only
+`/healthz` and `POST /api/triage` (the webhook route is not mounted). The server
+refuses to boot if neither GitHub nor `NOGENT_TRIAGE_SECRET` is configured.
 
 For AWS, store the three secrets as a **Secrets Manager JSON** with these keys
 (this is exactly what the Terraform user-data expects):

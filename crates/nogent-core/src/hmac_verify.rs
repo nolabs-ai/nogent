@@ -7,8 +7,17 @@
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Constant-time equality for shared secrets (e.g. the `/api/triage` bearer
+/// token). Returns `false` fast on a length mismatch — the length of a secret
+/// is not itself sensitive — but never short-circuits on content.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.ct_eq(b).into()
+}
 
 /// Verify a GitHub webhook signature header against the raw body.
 ///
@@ -55,6 +64,14 @@ mod tests {
     #[test]
     fn rejects_tampered_body() {
         assert!(!verify_signature(SECRET, b"Hello, World?", EXPECTED));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_secrets() {
+        assert!(constant_time_eq(b"s3cr3t", b"s3cr3t"));
+        assert!(!constant_time_eq(b"s3cr3t", b"s3cr3T"));
+        assert!(!constant_time_eq(b"s3cr3t", b"s3cr3t-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 
     #[test]

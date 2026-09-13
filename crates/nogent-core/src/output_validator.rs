@@ -8,7 +8,7 @@
 //! malicious diff from steering the bot into posting attacker-chosen text.
 
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Posted verbatim when validation fails. Never contains model-derived text.
 pub const FALLBACK_MESSAGE: &str = "🛡️ nogent could not produce a schema-conforming security review for this change \
@@ -19,6 +19,11 @@ pub const ISSUE_TRIAGE_FALLBACK_MESSAGE: &str = "🛡️ nogent could not produc
 (the model output failed canary/shape validation). A maintainer should review manually.";
 
 pub const ISSUE_TRIAGE_MARKER: &str = "<!-- nogent:issue-triage -->";
+
+/// Returned verbatim to the caller when a Question answer fails validation.
+/// Never contains model-derived text — an injected question cannot steer it.
+pub const QUESTION_FALLBACK_MESSAGE: &str = "nogent could not produce a schema-conforming answer for this question \
+(the model output failed canary/shape validation). A human should review manually.";
 
 pub const ISSUE_TRIAGE_FOOTER: &str = "Thanks for raising this issue, our maintainers often have a large amount of issues to work through. To help us resolve this for you more quickly, jump onto our discord, post the link and help us get more context and figure out a solution: https://discord.gg/G6qDa7cC7x";
 
@@ -441,6 +446,181 @@ pub fn format_issue_triage_fallback_markdown() -> String {
     format!("{ISSUE_TRIAGE_MARKER}\n\n{ISSUE_TRIAGE_FALLBACK_MESSAGE}\n\n{ISSUE_TRIAGE_FOOTER}")
 }
 
+// ── Question answer ───────────────────────────────────────────────────────
+
+const QUESTION_MAX_CITATIONS: usize = 20;
+const QUESTION_MAX_MISSING_INFO: usize = 10;
+
+/// Allowed `classification` values. An out-of-set value fails validation (the
+/// caller never receives a made-up class). Keep in sync with the question
+/// system prompt's output contract.
+const CLASSIFICATIONS: [&str; 7] = [
+    "usage_question",
+    "bug_report",
+    "feature_request",
+    "documentation_gap",
+    "duplicate",
+    "off_topic",
+    "needs_more_info",
+];
+
+/// Allowed `suggested_action` values (platform-neutral; the caller maps these
+/// to a concrete Linear/Discord operation). Keep in sync with the prompt.
+const SUGGESTED_ACTIONS: [&str; 5] = [
+    "none",
+    "answer_directly",
+    "triage_to_human",
+    "create_ticket",
+    "link_duplicate",
+];
+
+/// Fixed values used by the fallback and referenced by tests.
+const FALLBACK_CLASSIFICATION: &str = "needs_more_info";
+const FALLBACK_ACTION: &str = "triage_to_human";
+
+/// Validated model output for a [`crate::events::JobKind::Question`] run.
+/// `canary`-gated like the other output types; the caller-facing shape is
+/// [`QuestionAnswerResponse`].
+///
+/// Not `deny_unknown_fields`: tolerate extra keys the model invents — the
+/// canary, not schema strictness, is the injection gate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuestionAnswerOutput {
+    pub canary: String,
+    #[serde(default)]
+    pub answer: String,
+    /// Model self-rated confidence in [0.0, 1.0]. Out-of-range fails validation.
+    #[serde(default)]
+    pub confidence: f64,
+    /// One of [`CLASSIFICATIONS`] (normalized to lowercase).
+    #[serde(default)]
+    pub classification: String,
+    /// The model's signal that a human should review before the answer is used.
+    #[serde(default)]
+    pub needs_human: bool,
+    /// One of [`SUGGESTED_ACTIONS`] (normalized to lowercase).
+    #[serde(default)]
+    pub suggested_action: String,
+    /// `source_id`s the answer draws on — filtered to ones actually supplied in
+    /// the request context, so a hallucinated citation never reaches the caller.
+    #[serde(default)]
+    pub citations: Vec<String>,
+    /// What the model still needs to answer confidently (free-text, capped).
+    #[serde(default)]
+    pub missing_information: Vec<String>,
+    /// `source_id`s of likely duplicates — filtered against the request context.
+    #[serde(default)]
+    pub possible_duplicates: Vec<String>,
+}
+
+/// The clean, canary-stripped JSON body returned to the caller of the triage
+/// ingress. Never includes the canary or any triage/GitHub framing.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuestionAnswerResponse {
+    pub answer: String,
+    pub confidence: f64,
+    pub classification: String,
+    pub needs_human: bool,
+    pub suggested_action: String,
+    pub citations: Vec<String>,
+    pub missing_information: Vec<String>,
+    pub possible_duplicates: Vec<String>,
+}
+
+/// Keep only `source_id`s the caller actually supplied, de-duplicated and
+/// capped. Reliability guarantee: a model-invented id can never reach the
+/// caller as a citation or duplicate.
+fn filter_source_ids(ids: Vec<String>, valid_source_ids: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .filter(|id| valid_source_ids.iter().any(|v| v == id))
+        .filter(|id| seen.insert(id.clone()))
+        .take(QUESTION_MAX_CITATIONS)
+        .collect()
+}
+
+/// Validate a raw model string as a question answer. `valid_source_ids` is the
+/// set of `source_id`s from the request context; citations/duplicates are
+/// filtered to it. Returns `None` on any core-field failure (caller emits
+/// [`question_answer_fallback_json`]).
+#[must_use]
+pub fn validate_question_answer(
+    raw: &str,
+    expected_canary: &str,
+    valid_source_ids: &[String],
+) -> Option<QuestionAnswerOutput> {
+    let stripped = extract_object(raw);
+    let mut parsed: QuestionAnswerOutput = serde_json::from_str(stripped).ok()?;
+    if !canary_matches(&parsed.canary, expected_canary) {
+        return None;
+    }
+    // Core decision fields: strict — an out-of-contract value is not trustworthy.
+    if parsed.answer.trim().is_empty() || parsed.answer.chars().count() > MAX_SECTION_LEN {
+        return None;
+    }
+    if !parsed.confidence.is_finite() || !(0.0..=1.0).contains(&parsed.confidence) {
+        return None;
+    }
+    let classification = parsed.classification.trim().to_ascii_lowercase();
+    if !CLASSIFICATIONS.contains(&classification.as_str()) {
+        return None;
+    }
+    parsed.classification = classification;
+    let action = parsed.suggested_action.trim().to_ascii_lowercase();
+    if !SUGGESTED_ACTIONS.contains(&action.as_str()) {
+        return None;
+    }
+    parsed.suggested_action = action;
+    // List fields: lenient — filter/cap rather than reject the whole answer.
+    parsed.citations = filter_source_ids(parsed.citations, valid_source_ids);
+    parsed.possible_duplicates = filter_source_ids(parsed.possible_duplicates, valid_source_ids);
+    parsed.missing_information = parsed
+        .missing_information
+        .into_iter()
+        .filter(|m| !m.trim().is_empty() && m.chars().count() <= MAX_FIELD_LEN)
+        .take(QUESTION_MAX_MISSING_INFO)
+        .collect();
+    Some(parsed)
+}
+
+/// Serialize a validated answer as the JSON body returned to the caller.
+#[must_use]
+pub fn format_question_answer_json(out: &QuestionAnswerOutput) -> String {
+    let response = QuestionAnswerResponse {
+        answer: out.answer.clone(),
+        confidence: out.confidence,
+        classification: out.classification.clone(),
+        needs_human: out.needs_human,
+        suggested_action: out.suggested_action.clone(),
+        citations: out.citations.clone(),
+        missing_information: out.missing_information.clone(),
+        possible_duplicates: out.possible_duplicates.clone(),
+    };
+    // Plain scalars/Vec<String>; serialization cannot fail. Fall back defensively.
+    serde_json::to_string(&response).unwrap_or_else(|_| question_answer_fallback_json())
+}
+
+/// Fixed fallback body used when model output fails validation. Flags
+/// `needs_human` and routes to a human so an injected question can't steer the
+/// caller into acting on a non-answer.
+#[must_use]
+pub fn question_answer_fallback_json() -> String {
+    let response = QuestionAnswerResponse {
+        answer: QUESTION_FALLBACK_MESSAGE.to_string(),
+        confidence: 0.0,
+        classification: FALLBACK_CLASSIFICATION.to_string(),
+        needs_human: true,
+        suggested_action: FALLBACK_ACTION.to_string(),
+        citations: Vec::new(),
+        missing_information: Vec::new(),
+        possible_duplicates: Vec::new(),
+    };
+    serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"answer":"nogent could not answer.","confidence":0.0,"classification":"needs_more_info","needs_human":true,"suggested_action":"triage_to_human","citations":[],"missing_information":[],"possible_duplicates":[]}"#
+            .to_string()
+    })
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 /// Best-effort isolation of the JSON object from a model response: strip a
@@ -648,6 +828,116 @@ mod tests {
     fn issue_triage_valid_passes() {
         let raw = r#"{"canary":"c","verdict":"config","suggested_resolution_path":".github/nogent.json","maintainer_notes":""}"#;
         assert!(validate_issue_triage(raw, "c").is_some());
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn question_answer_valid_passes_and_strips_canary() {
+        let raw = r#"{"canary":"c","answer":"Use --allow /tmp","confidence":0.84,
+            "classification":"Usage_Question","needs_human":false,"suggested_action":"None",
+            "citations":["github:issue:1"],"missing_information":[],"possible_duplicates":[]}"#;
+        let valid = ids(&["github:issue:1"]);
+        let out = validate_question_answer(raw, "c", &valid).expect("valid");
+        assert_eq!(out.answer, "Use --allow /tmp");
+        assert!((out.confidence - 0.84).abs() < 1e-9);
+        assert_eq!(out.classification, "usage_question"); // normalized
+        assert_eq!(out.suggested_action, "none"); // normalized
+        let json = format_question_answer_json(&out);
+        assert!(!json.contains("\"canary\"")); // no canary field leaks to caller
+        assert!(json.contains("\"confidence\":0.84"));
+        assert!(json.contains("github:issue:1"));
+    }
+
+    #[test]
+    fn question_answer_drops_hallucinated_citations_and_duplicates() {
+        let raw = r#"{"canary":"c","answer":"a","confidence":0.5,"classification":"duplicate",
+            "suggested_action":"link_duplicate",
+            "citations":["github:issue:1","github:issue:999"],
+            "possible_duplicates":["github:issue:1","made:up"]}"#;
+        let valid = ids(&["github:issue:1"]);
+        let out = validate_question_answer(raw, "c", &valid).expect("valid");
+        // Only the supplied source_id survives; invented ones are dropped.
+        assert_eq!(out.citations, vec!["github:issue:1".to_string()]);
+        assert_eq!(out.possible_duplicates, vec!["github:issue:1".to_string()]);
+    }
+
+    #[test]
+    fn question_answer_rejects_wrong_canary() {
+        let raw = r#"{"canary":"nope","answer":"x","confidence":0.5,"classification":"usage_question","suggested_action":"none"}"#;
+        assert!(validate_question_answer(raw, "c", &[]).is_none());
+    }
+
+    #[test]
+    fn question_answer_rejects_out_of_contract_core_fields() {
+        // Out-of-range confidence.
+        assert!(
+            validate_question_answer(
+                r#"{"canary":"c","answer":"x","confidence":1.5,"classification":"usage_question","suggested_action":"none"}"#,
+                "c",
+                &[]
+            )
+            .is_none()
+        );
+        // Unknown classification.
+        assert!(
+            validate_question_answer(
+                r#"{"canary":"c","answer":"x","confidence":0.5,"classification":"vibes","suggested_action":"none"}"#,
+                "c",
+                &[]
+            )
+            .is_none()
+        );
+        // Unknown suggested_action.
+        assert!(
+            validate_question_answer(
+                r#"{"canary":"c","answer":"x","confidence":0.5,"classification":"usage_question","suggested_action":"escalate_to_ceo"}"#,
+                "c",
+                &[]
+            )
+            .is_none()
+        );
+        // Empty answer.
+        assert!(
+            validate_question_answer(
+                r#"{"canary":"c","answer":"  ","confidence":0.5,"classification":"usage_question","suggested_action":"none"}"#,
+                "c",
+                &[]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn question_answer_rejects_oversized_answer_and_caps_lists() {
+        let big = "x".repeat(MAX_SECTION_LEN + 1);
+        let raw = format!(
+            r#"{{"canary":"c","answer":"{big}","confidence":0.5,"classification":"usage_question","suggested_action":"none"}}"#
+        );
+        assert!(validate_question_answer(&raw, "c", &[]).is_none());
+
+        // missing_information is capped, not rejected.
+        let items = (0..QUESTION_MAX_MISSING_INFO + 5)
+            .map(|i| format!("\"m{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            r#"{{"canary":"c","answer":"a","confidence":0.5,"classification":"needs_more_info","suggested_action":"triage_to_human","missing_information":[{items}]}}"#
+        );
+        let out = validate_question_answer(&raw, "c", &[]).expect("valid");
+        assert_eq!(out.missing_information.len(), QUESTION_MAX_MISSING_INFO);
+    }
+
+    #[test]
+    fn question_answer_fallback_flags_human_and_routes_to_human() {
+        let json = question_answer_fallback_json();
+        assert!(json.contains("\"needs_human\":true"));
+        assert!(json.contains("\"suggested_action\":\"triage_to_human\""));
+        assert!(json.contains("\"classification\":\"needs_more_info\""));
+        assert!(json.contains(QUESTION_FALLBACK_MESSAGE));
+        assert!(!json.contains("\"canary\"")); // no canary field leaks to caller
     }
 
     #[test]

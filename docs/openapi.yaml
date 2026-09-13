@@ -1,0 +1,211 @@
+openapi: 3.1.0
+info:
+  title: nogent triage API
+  version: "0.2.3"
+  description: >
+    Source-agnostic grounded Q&A triage. Stateless: no GitHub, no repo index,
+    nothing posted. The caller supplies grounding via `context` and receives a
+    canary-validated decision. See docs/api-triage.md for prose.
+  license:
+    name: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local (NOGENT_BIND_ADDR)
+  - url: https://{host}
+    description: Deployed (behind a TLS-terminating reverse proxy)
+    variables:
+      host:
+        default: nogent.example.com
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+
+  /api/triage:
+    post:
+      summary: Answer a question grounded on caller-supplied context
+      operationId: triageQuestion
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TriageRequest" }
+      responses:
+        "200":
+          description: >
+            Decision JSON — either a real answer or the fixed fallback (model
+            output failed validation). Always inspect `needs_human`; a 200 does
+            not imply the answer is safe to send unreviewed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuestionAnswerResponse" }
+        "400":
+          description: >
+            Invalid JSON, empty question, bad conversation role, bad context
+            trust, or a context source missing source_id.
+        "401":
+          description: Missing or invalid bearer token.
+        "404":
+          description: Endpoint disabled (NOGENT_TRIAGE_SECRET unset) or unknown path.
+        "413":
+          description: >
+            question/turn too long, too many turns or sources, or context over
+            NOGENT_TRIAGE_MAX_CONTEXT_BYTES.
+        "429":
+          description: Worker pool saturated; retry with backoff.
+        "502":
+          description: Upstream model (Gemini) call failed.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The shared secret configured as NOGENT_TRIAGE_SECRET.
+
+  schemas:
+    TriageRequest:
+      type: object
+      additionalProperties: false
+      required: [question]
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: The question to answer. Untrusted.
+        conversation:
+          type: array
+          maxItems: 50
+          default: []
+          items: { $ref: "#/components/schemas/ConversationTurn" }
+        context:
+          type: array
+          maxItems: 50
+          default: []
+          description: >
+            Retrieved grounding sources. Total serialized size is additionally
+            bounded by NOGENT_TRIAGE_MAX_CONTEXT_BYTES (default 262144).
+          items: { $ref: "#/components/schemas/ContextSource" }
+
+    ConversationTurn:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant]
+          description: Dialogue position only. Case-insensitive on input.
+        content:
+          type: string
+          maxLength: 8000
+        name:
+          type: string
+          description: Optional display label; not weighted by the model.
+
+    ContextSource:
+      type: object
+      additionalProperties: false
+      required: [source_id, content]
+      properties:
+        source_id:
+          type: string
+          minLength: 1
+          description: Stable id echoed verbatim in citations/possible_duplicates.
+        content:
+          type: string
+          description: The snippet text. Untrusted.
+        source_type:
+          type: string
+          description: Free-form caller taxonomy (e.g. closed_issue, doc, discussion).
+        title:
+          type: string
+        url:
+          type: string
+        version:
+          type: string
+          description: Product/doc version this source pertains to.
+        trust:
+          type: string
+          enum: [verified, community, unverified]
+          description: >
+            Canonicality signal. If present, must be one of the enum values.
+            The model weights verified > community > unverified.
+
+    QuestionAnswerResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - answer
+        - confidence
+        - classification
+        - needs_human
+        - suggested_action
+        - citations
+        - missing_information
+        - possible_duplicates
+      properties:
+        answer:
+          type: string
+        confidence:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 1.0
+          description: Model self-rating; treat as relative, not calibrated.
+        classification:
+          type: string
+          enum:
+            - usage_question
+            - bug_report
+            - feature_request
+            - documentation_gap
+            - duplicate
+            - off_topic
+            - needs_more_info
+        needs_human:
+          type: boolean
+          description: Primary approval gate; true whenever a human should review.
+        suggested_action:
+          type: string
+          enum:
+            - none
+            - answer_directly
+            - triage_to_human
+            - create_ticket
+            - link_duplicate
+          description: Platform-neutral; the caller maps this to a concrete op.
+        citations:
+          type: array
+          items: { type: string }
+          maxItems: 20
+          description: Subset of request context source_ids; hallucinated ids are dropped.
+        missing_information:
+          type: array
+          items: { type: string, maxLength: 300 }
+          maxItems: 10
+        possible_duplicates:
+          type: array
+          items: { type: string }
+          maxItems: 20
+          description: Subset of request context source_ids.
+      example:
+        answer: "Use `--allow-write /tmp` to grant write access to that path."
+        confidence: 0.86
+        classification: usage_question
+        needs_human: false
+        suggested_action: answer_directly
+        citations: ["docs:fs"]
+        missing_information: []
+        possible_duplicates: []

@@ -19,14 +19,17 @@
 
 pub mod issue_triage;
 pub mod pr_review;
+pub mod question;
 
 use std::path::PathBuf;
 
 pub const PR_REVIEW_SYSTEM_FILE: &str = "pr-review.system.md";
 pub const ISSUE_TRIAGE_SYSTEM_FILE: &str = "issue-triage.system.md";
+pub const QUESTION_SYSTEM_FILE: &str = "question.system.md";
 
 const PR_REVIEW_SYSTEM_DEFAULT: &str = include_str!("../../prompts/pr-review.system.md");
 const ISSUE_TRIAGE_SYSTEM_DEFAULT: &str = include_str!("../../prompts/issue-triage.system.md");
+const QUESTION_SYSTEM_DEFAULT: &str = include_str!("../../prompts/question.system.md");
 
 /// Load a prompt template by file name, preferring `$NOGENT_PROMPTS_DIR` and
 /// falling back to the embedded default.
@@ -53,6 +56,13 @@ pub fn pr_review_system(canary: &str) -> String {
 pub fn issue_triage_system(canary: &str) -> String {
     load_template(ISSUE_TRIAGE_SYSTEM_FILE, ISSUE_TRIAGE_SYSTEM_DEFAULT)
         .replace("{{canary}}", canary)
+}
+
+/// Render the question (Q&A triage) system instruction with the run canary
+/// substituted.
+#[must_use]
+pub fn question_system(canary: &str) -> String {
+    load_template(QUESTION_SYSTEM_FILE, QUESTION_SYSTEM_DEFAULT).replace("{{canary}}", canary)
 }
 
 /// Append maintainer-authored repo guidance (from `NOGENT.md` on the base
@@ -89,6 +99,15 @@ mod tests {
         let s = issue_triage_system("XYZ");
         assert!(s.contains("XYZ"));
         assert!(!s.contains("{{canary}}"));
+    }
+
+    #[test]
+    fn embedded_question_prompt_substitutes_canary_and_states_contract() {
+        let s = question_system("QCAN");
+        assert!(s.contains("QCAN"));
+        assert!(!s.contains("{{canary}}"));
+        assert!(s.contains("untrusted_context"));
+        assert!(s.contains("needs_human"));
     }
 
     #[test]
